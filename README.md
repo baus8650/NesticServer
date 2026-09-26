@@ -42,12 +42,22 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `APPLE_CLIENT_ID` | `com.bausch.Nestic-iOS` (the iOS app's bundle identifier) |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
+   | `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |
+   | `R2_BUCKET` | `nestic-photos` |
+   | `R2_ACCESS_KEY_ID` | Cloudflare R2 S3 Access Key ID for the bucket-scoped token |
+   | `R2_SECRET_ACCESS_KEY` | Cloudflare R2 S3 Secret Access Key for the bucket-scoped token |
 
 4. Deploy with the supplied Dockerfile and leave the container start command unchanged. Migrations run before the server starts when `AUTO_MIGRATE=true`.
 5. Generate a Railway HTTPS domain and enter it in the iOS app's server setting. For your domain, add `api.nestic-app.com` as a custom domain and copy Railway's exact DNS target into your domain provider. Reserve `www.nestic-app.com` for a website later.
 6. Run **one API replica**. WebSocket fanout currently lives in memory within one process. Add Redis or another shared event bus before increasing replica count. Clients refresh when reconnecting to recover updates missed during restarts.
 
 Production startup refuses a missing or short JWT secret. Changing the secret signs everyone out. Tokens expire after seven days; users then sign in again. Configure PostgreSQL backups through your hosting provider before storing important data. Push notifications, background delivery while iOS suspends the app, email verification, and password recovery are not implemented in this version.
+
+### Cloudflare R2 photos
+
+Subject photos use the private `nestic-photos` Cloudflare R2 bucket. The server stores only an `r2://...` object reference in PostgreSQL and proxies photo reads after checking nest membership; the bucket does not need public access. The iOS app compresses camera-library photos to JPEG before uploading them, which keeps request sizes within the server's 2 MB limit.
+
+Create a Cloudflare R2 API token with **Object Read & Write** access scoped only to `nestic-photos`, then add the four `R2_*` variables above to the Railway API service. Keep the access key and secret in Railway's encrypted variables only; never commit them to `.env`, source control, or chat. If the variables are missing, the API still starts, but the photo endpoints return `503` until storage is configured.
 
 ## TestFlight beta deployment
 
@@ -85,6 +95,7 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `PATCH /nests/:id/members/:userID`, `DELETE /nests/:id/members/:userID` | Owner changes role or removes member; the last owner is protected |
 | `GET /nests/:id/entities`, `POST /nests/:id/entities` | List; create `{kind,name,tags?,metadata?,birthday?,imageURL?}` |
 | `PATCH /entities/:id`, `DELETE /entities/:id` | Edit; remove subject and its activity |
+| `PUT /entities/:id/photo`, `GET /entities/:id/photo`, `DELETE /entities/:id/photo` | Upload, read, or remove a private JPEG subject photo |
 | `GET /nests/:id/actions`, `POST /nests/:id/actions` | List; define tracker `{name,valueType,unit?,description?}` |
 | `PATCH /actions/:id`, `DELETE /actions/:id` | Edit tracker metadata or remove a tracker, its quick-action pins, and its history |
 | `GET /entities/:id/pinned-actions`, `PUT /entities/:id/pinned-actions` | Read; replace pins with `{actionIds:[UUID]}` |

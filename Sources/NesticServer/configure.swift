@@ -14,7 +14,16 @@ public func configure(_ app: Application) async throws {
     app.passwords.use(.bcrypt)
     app.http.server.configuration.hostname = "0.0.0.0"
     app.http.server.configuration.port = Environment.get("PORT").flatMap(Int.init) ?? 8080
-    app.routes.defaultMaxBodySize = "64kb"
+    // Subject avatars are compressed on-device before their binary upload to R2.
+    app.routes.defaultMaxBodySize = "2mb"
+
+    if let r2Configuration = R2StorageConfiguration() {
+        app.r2Storage = R2Storage(configuration: r2Configuration)
+        app.lifecycle.use(R2StorageLifecycle())
+        app.logger.info("Cloudflare R2 photo storage is configured", metadata: ["bucket": .string(r2Configuration.bucket)])
+    } else {
+        app.logger.warning("Cloudflare R2 photo storage is not configured; subject photo endpoints will return 503")
+    }
 
     if let databaseURL = Environment.get("DATABASE_URL") {
         let postgresConfiguration = try postgresConfiguration(for: databaseURL)

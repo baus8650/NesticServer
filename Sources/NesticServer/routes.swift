@@ -227,6 +227,7 @@ struct EntitySummaryDTO: Content {
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
     try authRoutes(app)
+    registerPhotoRoutes(protected)
 
     app.get { req async in
         "It works!"
@@ -872,6 +873,11 @@ func routes(_ app: Application) throws {
                 .delete()
 
             try await entity.delete(on: tx)
+        }
+
+        if let key = R2Storage.key(from: entity.imageURL),
+           let storage = req.application.r2Storage {
+            try? await storage.delete(key: key, logger: req.logger)
         }
 
         req.application.realtimeHub.broadcast(
