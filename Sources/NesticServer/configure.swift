@@ -1,3 +1,4 @@
+import Foundation
 import NIOSSL
 import Fluent
 import FluentPostgresDriver
@@ -16,7 +17,8 @@ public func configure(_ app: Application) async throws {
     app.routes.defaultMaxBodySize = "64kb"
 
     if let databaseURL = Environment.get("DATABASE_URL") {
-        app.databases.use(try .postgres(url: databaseURL), as: .psql)
+        let postgresConfiguration = try postgresConfiguration(for: databaseURL)
+        app.databases.use(.postgres(configuration: postgresConfiguration), as: .psql)
     } else {
         let postgresConfiguration = SQLPostgresConfiguration(
             hostname: Environment.get("DATABASE_HOST") ?? "localhost",
@@ -43,4 +45,36 @@ public func configure(_ app: Application) async throws {
     }
     _ = app.realtimeHub
     try routes(app)
+}
+
+private func postgresConfiguration(for databaseURL: String) throws -> SQLPostgresConfiguration {
+    guard Environment.get("DATABASE_TLS_MODE")?.lowercased() == "require-unverified" else {
+        return try SQLPostgresConfiguration(url: databaseURL)
+    }
+
+    guard let url = URL(string: databaseURL),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          let hostname = components.host,
+          hostname.hasSuffix(".railway.internal"),
+          let username = components.user?.removingPercentEncoding else {
+        throw Abort(.internalServerError, reason: "DATABASE_TLS_MODE=require-unverified requires Railway's private DATABASE_URL.")
+    }
+
+    var tlsConfiguration = TLSConfiguration.makeClientConfiguration()
+    // Railway's stock Postgres image uses a deployment-local self-signed certificate.
+    // Keep the connection encrypted, but do not require a public CA or hostname match.
+    tlsConfiguration.certificateVerification = .none
+    let tls = try PostgresConnection.Configuration.TLS.require(
+        NIOSSLContext(configuration: tlsConfiguration)
+    )
+
+    let databasePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return SQLPostgresConfiguration(
+        hostname: hostname,
+        port: components.port ?? SQLPostgresConfiguration.ianaPortNumber,
+        username: username,
+        password: components.password?.removingPercentEncoding,
+        database: databasePath.isEmpty ? nil : databasePath.removingPercentEncoding,
+        tls: tls
+    )
 }

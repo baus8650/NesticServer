@@ -37,6 +37,7 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | Variable | Value |
    | --- | --- |
    | `DATABASE_URL` | Reference the PostgreSQL service's `DATABASE_URL` |
+   | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A randomly generated secret of at least 32 bytes; generate one with `openssl rand -hex 32` |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
@@ -57,6 +58,7 @@ The API must be public before a TestFlight build can support real accounts and s
    | Variable | Value |
    | --- | --- |
    | `DATABASE_URL` | Reference the PostgreSQL service’s `DATABASE_URL` |
+   | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A new random value from `openssl rand -hex 32` |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
