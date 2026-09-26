@@ -39,6 +39,7 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `DATABASE_URL` | Reference the PostgreSQL service's `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A randomly generated secret of at least 32 bytes; generate one with `openssl rand -hex 32` |
+   | `APPLE_CLIENT_ID` | `com.bausch.Nestic-iOS` (the iOS app's bundle identifier) |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
 
@@ -60,12 +61,13 @@ The API must be public before a TestFlight build can support real accounts and s
    | `DATABASE_URL` | Reference the PostgreSQL service’s `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A new random value from `openssl rand -hex 32` |
+   | `APPLE_CLIENT_ID` | `com.bausch.Nestic-iOS` (the iOS app's bundle identifier) |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
 
 3. Deploy one API replica and generate its HTTPS domain. Check `https://your-domain/health`; it should return a successful JSON response. Keep one replica because WebSocket fanout is currently held in process memory.
 4. Optionally point `api.nestic-app.com` at the Railway domain. The iOS Release configuration currently uses `https://api.nestic-app.com`; if you use the generated Railway URL instead, change the Release `NESTIC_SERVER_URL` setting before archiving the TestFlight build.
-5. Create a real account from the app and create a nest. Do not enable `SEED_DEMO_DATA` on the hosted service. The sample nest in the iOS app is local-only and is not a hosted account.
+5. In Apple Developer, enable the **Sign in with Apple** capability for the `com.bausch.Nestic-iOS` App ID, then refresh the app's signing profiles in Xcode. The iOS project includes the entitlement and the API verifies Apple's identity token server-side. Existing email/password users can sign in normally and link Apple from **Settings → Account security**; new users can use Apple directly. Do not enable `SEED_DEMO_DATA` on the hosted service. The sample nest in the iOS app is local-only and is not a hosted account.
 
 The API does not currently send email invitations. For the first beta, share the TestFlight link separately, have each tester register inside Nestic, and add their registered email from the nest’s member controls. Email verification, password recovery, push notifications, and background delivery are follow-up production work.
 

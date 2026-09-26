@@ -32,6 +32,7 @@ public func configure(_ app: Application) async throws {
     }
 
     app.migrations.add(CreateUsers())
+    app.migrations.add(AddAppleIdentity())
     app.migrations.add(CreateNests())
     app.migrations.add(CreateNestMembers())
     app.migrations.add(CreateEntities())

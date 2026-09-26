@@ -23,6 +23,9 @@ final class User: Model, Content, @unchecked Sendable {
     @Field(key: "password_hash")
     var passwordHash: String
 
+    @OptionalField(key: "apple_subject")
+    var appleSubject: String?
+
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
 
@@ -34,11 +37,12 @@ final class User: Model, Content, @unchecked Sendable {
 
     init() {}
 
-    init(email: String, passwordHash: String, displayName: String, imageURL: String? = nil) {
+    init(email: String, passwordHash: String, displayName: String, imageURL: String? = nil, appleSubject: String? = nil) {
         self.email = email
         self.passwordHash = passwordHash
         self.displayName = displayName
         self.imageURL = imageURL
+        self.appleSubject = appleSubject
     }
 }
 
