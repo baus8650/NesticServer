@@ -1,2 +1,6 @@
 .build/
 .swiftpm/
+.git/
+.env
+.env.*
+!.env.example

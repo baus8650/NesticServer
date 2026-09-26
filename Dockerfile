@@ -1,7 +1,7 @@
 # ================================
 # Build image
 # ================================
-FROM swift:6.1-noble AS build
+FROM swift:6.2-noble AS build
 
 # Install OS updates
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
@@ -88,4 +88,4 @@ EXPOSE 8080
 
 # Start the Vapor service when the image is run, default to listening on 8080 in production environment
 ENTRYPOINT ["./NesticServer"]
-CMD ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+CMD ["serve", "--env", "production", "--hostname", "0.0.0.0"]
