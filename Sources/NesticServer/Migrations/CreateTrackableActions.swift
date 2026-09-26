@@ -15,6 +15,8 @@ struct CreateTrackableActions: AsyncMigration {
             .field("name", .string, .required)        // "Fed", "Walked", "Weight", etc.
             .field("value_type", .string, .required)  // none/number/text/boolean/json
             .field("unit", .string)                   // optional
+            .field("symbol", .string)                 // SF Symbol name or emoji
+            .field("color", .string)                  // six-digit hex color
             .field("description", .string)            // optional
 
             .field("created_at", .datetime)

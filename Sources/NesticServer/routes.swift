@@ -136,6 +136,8 @@ struct TrackableActionResponse: Content {
     let name: String
     let valueType: ActionValueType
     let unit: String?
+    let symbol: String?
+    let color: String?
     let description: String?
     let createdAt: Date?
     let updatedAt: Date?
@@ -198,6 +200,8 @@ struct PinnedActionDTO: Content {
     let name: String
     let valueType: ActionValueType
     let unit: String?
+    let symbol: String?
+    let color: String?
     let sortOrder: Int
 }
 
@@ -221,6 +225,8 @@ struct PinnedActionSummaryDTO: Content {
     let actionName: String
     let valueType: ActionValueType
     let unit: String?
+    let symbol: String?
+    let color: String?
     let sortOrder: Int
     let last: LastEventSummaryDTO?
 }
@@ -702,6 +708,8 @@ func routes(_ app: Application) throws {
                     actionName: pin.action.name,
                     valueType: pin.action.valueType,
                     unit: pin.action.unit,
+                    symbol: pin.action.symbol,
+                    color: pin.action.color,
                     sortOrder: pin.sortOrder,
                     last: lastDTO
                 )
@@ -926,6 +934,8 @@ func routes(_ app: Application) throws {
                 name: a.name,
                 valueType: a.valueType,
                 unit: a.unit,
+                symbol: a.symbol,
+                color: a.color,
                 description: a.description,
                 createdAt: a.createdAt,
                 updatedAt: a.updatedAt
@@ -959,16 +969,22 @@ func routes(_ app: Application) throws {
             let name: String
             let valueType: ActionValueType   // none/number/text/boolean/json
             let unit: String?
+            let symbol: String?
+            let color: String?
             let description: String?
         }
 
         let input = try req.content.decode(CreateActionRequest.self)
+        let symbol = try InputValidation.trackerSymbol(input.symbol)
+        let color = try InputValidation.trackerColor(input.color)
 
         let action = TrackableAction(
             nestID: nestID,
             name: try InputValidation.name(input.name),
             valueType: input.valueType,
             unit: input.unit,
+            symbol: symbol,
+            color: color,
             description: input.description
         )
 
@@ -982,6 +998,8 @@ func routes(_ app: Application) throws {
             name: action.name,
             valueType: action.valueType,
             unit: action.unit,
+            symbol: action.symbol,
+            color: action.color,
             description: action.description,
             createdAt: action.createdAt,
             updatedAt: action.updatedAt
@@ -1018,6 +1036,8 @@ func routes(_ app: Application) throws {
             let name: String?
             let valueType: ActionValueType?
             let unit: String?
+            let symbol: String?
+            let color: String?
             let description: String?
         }
         let input = try req.content.decode(UpdateActionRequest.self)
@@ -1025,11 +1045,15 @@ func routes(_ app: Application) throws {
         if let valueType = input.valueType { action.valueType = valueType }
         action.unit = input.unit?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? input.unit : nil
         if action.valueType != .number { action.unit = nil }
+        if let symbol = input.symbol { action.symbol = try InputValidation.trackerSymbol(symbol) }
+        if let color = input.color { action.color = try InputValidation.trackerColor(color) }
         if let description = input.description { action.description = description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : description }
         try await action.save(on: req.db)
 
         let response = TrackableActionResponse(id: try action.requireID(), nestId: nestID, name: action.name,
                                                valueType: action.valueType, unit: action.unit,
+                                               symbol: action.symbol,
+                                               color: action.color,
                                                description: action.description, createdAt: action.createdAt,
                                                updatedAt: action.updatedAt)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)
@@ -1098,6 +1122,8 @@ func routes(_ app: Application) throws {
                 name: pin.action.name,
                 valueType: pin.action.valueType,
                 unit: pin.action.unit,
+                symbol: pin.action.symbol,
+                color: pin.action.color,
                 sortOrder: pin.sortOrder
             )
         }

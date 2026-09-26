@@ -47,6 +47,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateNestMembers())
     app.migrations.add(CreateEntities())
     app.migrations.add(CreateTrackableActions())
+    app.migrations.add(AddTrackerSymbols())
+    app.migrations.add(AddTrackerColors())
     app.migrations.add(CreateActionEvents())
     app.migrations.add(CreateEntityPinnedActions())
     app.migrations.add(AddPerformanceIndexes())

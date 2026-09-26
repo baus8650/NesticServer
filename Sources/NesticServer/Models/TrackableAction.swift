@@ -34,6 +34,12 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
     @OptionalField(key: "unit")
     var unit: String? // e.g. "lb", "kg", "min"
 
+    @OptionalField(key: "symbol")
+    var symbol: String? // an SF Symbol name or emoji chosen by the user
+
+    @OptionalField(key: "color")
+    var color: String? // a six-digit hex color chosen by the user
+
     @OptionalField(key: "description")
     var description: String?
 
@@ -45,12 +51,14 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
 
     init() {}
 
-    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, description: String? = nil) {
+    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, symbol: String? = nil, color: String? = nil, description: String? = nil) {
         self.id = id
         self.$nest.id = nestID
         self.name = name
         self.valueType = valueType
         self.unit = unit
+        self.symbol = symbol
+        self.color = color
         self.description = description
     }
 }

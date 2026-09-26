@@ -27,6 +27,26 @@ enum InputValidation {
         }
     }
 
+    static func trackerSymbol(_ value: String?) throws -> String? {
+        guard let value else { return nil }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.count <= 64 else {
+            throw Abort(.badRequest, reason: "Choose a shorter tracker icon.")
+        }
+        return clean.isEmpty ? nil : clean
+    }
+
+    static func trackerColor(_ value: String?) throws -> String? {
+        guard let value else { return nil }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        let digits = clean.hasPrefix("#") ? String(clean.dropFirst()) : clean
+        guard digits.count == 6, UInt64(digits, radix: 16) != nil else {
+            throw Abort(.badRequest, reason: "Choose a valid tracker color.")
+        }
+        return "#\(digits.uppercased())"
+    }
+
     static func event(type: ActionValueType, number: Double?, text: String?, boolean: Bool?,
                       json: [String: String]?, note: String?) throws {
         let supplied = [number != nil, text != nil, boolean != nil, json != nil].filter { $0 }.count
