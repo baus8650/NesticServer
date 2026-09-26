@@ -19,8 +19,9 @@ public func configure(_ app: Application) async throws {
 
     if let r2Configuration = R2StorageConfiguration() {
         app.r2Storage = R2Storage(configuration: r2Configuration)
+        app.r2UsageLimiter = R2UsageLimiter()
         app.lifecycle.use(R2StorageLifecycle())
-        app.logger.info("Cloudflare R2 photo storage is configured", metadata: ["bucket": .string(r2Configuration.bucket)])
+        app.logger.info("Cloudflare R2 photo storage is configured with usage limits", metadata: ["bucket": .string(r2Configuration.bucket)])
     } else {
         app.logger.warning("Cloudflare R2 photo storage is not configured; subject photo endpoints will return 503")
     }

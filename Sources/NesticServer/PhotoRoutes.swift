@@ -68,17 +68,34 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
             throw Abort(.serviceUnavailable, reason: "Photo storage is not configured on the server")
         }
 
+        let session = try req.auth.require(SessionToken.self)
         let (entity, nestID) = try await editableEntity(for: req)
         let contentType = req.headers.contentType?.description.lowercased() ?? "image/jpeg"
         guard supportedPhotoContentTypes.contains(contentType) else {
             throw Abort(.unsupportedMediaType, reason: "Subject photos must be JPEG images")
+        }
+        let maximumPhotoBytes = req.application.r2UsageLimiter.limits.maxUploadBytesPerPhoto
+        if let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
+           contentLength > maximumPhotoBytes {
+            throw R2UsageLimitError.photoTooLarge(maxBytes: maximumPhotoBytes).abort
         }
         guard let body = req.body.data, body.readableBytes > 0 else {
             throw Abort(.badRequest, reason: "The subject photo is empty")
         }
 
         let key = R2Storage.key(for: try entity.requireID())
-        try await storage.put(key: key, body: body, contentType: contentType, logger: req.logger)
+        let byteCount = Int64(body.readableBytes)
+        do {
+            try await req.application.r2UsageLimiter.reserveUpload(userID: session.userId, bytes: byteCount)
+        } catch let error as R2UsageLimitError {
+            throw error.abort
+        }
+        do {
+            try await storage.put(key: key, body: body, contentType: contentType, logger: req.logger)
+        } catch {
+            await req.application.r2UsageLimiter.refundUpload(userID: session.userId, bytes: byteCount)
+            throw error
+        }
         entity.imageURL = R2Storage.reference(for: key)
         try await entity.save(on: req.db)
 
@@ -95,6 +112,11 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
         let entity = try await readableEntity(for: req)
         guard let key = R2Storage.key(from: entity.imageURL) else {
             throw Abort(.notFound, reason: "This subject does not have a photo")
+        }
+        do {
+            try await req.application.r2UsageLimiter.reserveRead(userID: try req.requireUserID())
+        } catch let error as R2UsageLimitError {
+            throw error.abort
         }
         guard let body = try await storage.get(key: key, logger: req.logger) else {
             throw Abort(.notFound, reason: "This subject photo is unavailable")

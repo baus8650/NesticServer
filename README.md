@@ -46,6 +46,15 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `R2_BUCKET` | `nestic-photos` |
    | `R2_ACCESS_KEY_ID` | Cloudflare R2 S3 Access Key ID for the bucket-scoped token |
    | `R2_SECRET_ACCESS_KEY` | Cloudflare R2 S3 Secret Access Key for the bucket-scoped token |
+   | `R2_MAX_UPLOAD_BYTES` | Optional; default `524288` (512 KB per photo) |
+   | `R2_DAILY_UPLOAD_BYTES_PER_USER` | Optional; default `5242880` (5 MB per user/day) |
+   | `R2_DAILY_UPLOADS_PER_USER` | Optional; default `20` |
+   | `R2_UPLOADS_PER_MINUTE_PER_USER` | Optional; default `6` |
+   | `R2_DAILY_READS_PER_USER` | Optional; default `1000` |
+   | `R2_READS_PER_MINUTE_PER_USER` | Optional; default `60` |
+   | `R2_DAILY_UPLOAD_BYTES_TOTAL` | Optional; default `104857600` (100 MB/day for the service) |
+   | `R2_DAILY_UPLOADS_TOTAL` | Optional; default `500` |
+   | `R2_DAILY_READS_TOTAL` | Optional; default `10000` |
 
 4. Deploy with the supplied Dockerfile and leave the container start command unchanged. Migrations run before the server starts when `AUTO_MIGRATE=true`.
 5. Generate a Railway HTTPS domain and enter it in the iOS app's server setting. For your domain, add `api.nestic-app.com` as a custom domain and copy Railway's exact DNS target into your domain provider. Reserve `www.nestic-app.com` for a website later.
@@ -58,6 +67,8 @@ Production startup refuses a missing or short JWT secret. Changing the secret si
 Subject photos use the private `nestic-photos` Cloudflare R2 bucket. The server stores only an `r2://...` object reference in PostgreSQL and proxies photo reads after checking nest membership; the bucket does not need public access. The iOS app compresses camera-library photos to JPEG before uploading them, which keeps request sizes within the server's 2 MB limit.
 
 Create a Cloudflare R2 API token with **Object Read & Write** access scoped only to `nestic-photos`, then add the four `R2_*` variables above to the Railway API service. Keep the access key and secret in Railway's encrypted variables only; never commit them to `.env`, source control, or chat. If the variables are missing, the API still starts, but the photo endpoints return `503` until storage is configured.
+
+The API also applies a process-local R2 safety guard. By default, one photo is limited to 512 KB, each user can upload 5 MB or 20 photos per UTC day, uploads are burst-limited to 6 per minute, and photo reads are limited to 60 per minute and 1,000 per day per user. The service-wide defaults are 100 MB of uploads, 500 uploads, and 10,000 reads per UTC day. Requests that exceed a limit receive `413` or `429` with a `Retry-After` header. Override these defaults with the `R2_*` limit variables in Railway if your beta size requires it. Keep one API replica while using this guard; the counters are intentionally in-process because the current deployment does not use Redis.
 
 ## TestFlight beta deployment
 
