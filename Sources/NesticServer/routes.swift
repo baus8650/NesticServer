@@ -154,6 +154,16 @@ struct ActionEventResponse: Content {
     let valueJSON: [String: String]?
     let note: String?
 }
+
+struct UpdateEventRequest: Content {
+    let occurredAt: Date
+    let valueNumber: Double?
+    let valueText: String?
+    let valueBool: Bool?
+    let valueJSON: [String: String]?
+    let note: String?
+}
+
 struct MemberResponse: Content {
     let userId: UUID
     let email: String
@@ -1302,6 +1312,47 @@ func routes(_ app: Application) throws {
         let events = try await ActionEvent.query(on: req.db)
             .filter(\.$nest.$id == nestID).sort(\.$occurredAt, .descending).range(..<limit).all()
         return try events.map { try $0.response() }
+    }
+
+    protected.patch("events", ":eventID") { req async throws -> ActionEventResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let eventID = try req.parameters.require("eventID", as: UUID.self)
+        guard let event = try await ActionEvent.find(eventID, on: req.db) else {
+            throw Abort(.notFound, reason: "Activity not found")
+        }
+
+        let nestID = event.$nest.id
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first(), membership.role != .viewer,
+            event.$actor.id == session.userId || membership.role == .admin || membership.role == .owner else {
+            throw Abort(.forbidden, reason: "Only the person who logged this activity or a nest administrator can edit it")
+        }
+
+        let input = try req.content.decode(UpdateEventRequest.self)
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db) else {
+            throw Abort(.badRequest, reason: "This tracker is no longer available")
+        }
+        try InputValidation.event(type: action.valueType, number: input.valueNumber,
+                                  text: input.valueText, boolean: input.valueBool,
+                                  json: input.valueJSON, note: input.note)
+        guard input.occurredAt.timeIntervalSinceNow <= 300 else {
+            throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
+        }
+
+        event.occurredAt = input.occurredAt
+        event.valueNumber = input.valueNumber
+        event.valueText = input.valueText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        event.valueBool = input.valueBool
+        event.valueJSON = input.valueJSON
+        let cleanedNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        event.note = cleanedNote?.isEmpty == true ? nil : cleanedNote
+        try await event.save(on: req.db)
+
+        let response = try event.response()
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
     }
 
     protected.delete("events", ":eventID") { req async throws -> HTTPStatus in
