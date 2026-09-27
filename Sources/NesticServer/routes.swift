@@ -240,6 +240,17 @@ struct EntitySummaryDTO: Content {
     let pinned: [PinnedActionSummaryDTO]
 }
 
+private func eventCursorDate(from req: Request) -> Date? {
+    guard let raw = try? req.query.get(String.self, at: "before") else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: raw) { return date }
+    formatter.formatOptions = [.withInternetDateTime]
+    if let date = formatter.date(from: raw) { return date }
+    if let seconds = Double(raw) { return Date(timeIntervalSince1970: seconds) }
+    return nil
+}
+
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
     try authRoutes(app)
@@ -1303,11 +1314,13 @@ func routes(_ app: Application) throws {
         }
 
         let limit = min(200, max(1, (try? req.query.get(Int.self, at: "limit")) ?? 100))
-        let events = try await ActionEvent.query(on: req.db)
+        var query = ActionEvent.query(on: req.db)
             .filter(\.$entity.$id == entityID)
             .sort(\.$occurredAt, .descending)
-            .range(..<limit)
-            .all()
+        if let before = eventCursorDate(from: req) {
+            query = query.filter(\.$occurredAt < before)
+        }
+        let events = try await query.range(..<limit).all()
 
         return events.compactMap { e in
             guard let id = e.id else { return nil }
@@ -1335,8 +1348,13 @@ func routes(_ app: Application) throws {
             throw Abort(.forbidden, reason: "Not a member of this nest")
         }
         let limit = min(200, max(1, (try? req.query.get(Int.self, at: "limit")) ?? 100))
-        let events = try await ActionEvent.query(on: req.db)
-            .filter(\.$nest.$id == nestID).sort(\.$occurredAt, .descending).range(..<limit).all()
+        var query = ActionEvent.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .sort(\.$occurredAt, .descending)
+        if let before = eventCursorDate(from: req) {
+            query = query.filter(\.$occurredAt < before)
+        }
+        let events = try await query.range(..<limit).all()
         return try events.map { try $0.response() }
     }
 

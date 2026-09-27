@@ -39,7 +39,7 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `DATABASE_URL` | Reference the PostgreSQL service's `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A randomly generated secret of at least 32 bytes; generate one with `openssl rand -hex 32` |
-   | `APPLE_CLIENT_ID` | `com.bausch.Nestic-iOS` (the iOS app's bundle identifier) |
+   | `APPLE_CLIENT_IDS` | Comma-separated Apple audiences, for example `com.bausch.Nestic-iOS,com.example.nestic.web` |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
    | `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |
@@ -55,12 +55,15 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `R2_DAILY_UPLOAD_BYTES_TOTAL` | Optional; default `104857600` (100 MB/day for the service) |
    | `R2_DAILY_UPLOADS_TOTAL` | Optional; default `500` |
    | `R2_DAILY_READS_TOTAL` | Optional; default `10000` |
+   | `AUTH_LOGIN_LIMIT` | Optional; default `12` attempts per client per minute |
+   | `AUTH_REGISTER_LIMIT` | Optional; default `6` registrations per client per hour |
+   | `AUTH_APPLE_LIMIT` | Optional; default `12` Apple auth requests per client per minute |
 
 4. Deploy with the supplied Dockerfile and leave the container start command unchanged. Migrations run before the server starts when `AUTO_MIGRATE=true`.
 5. Generate a Railway HTTPS domain and enter it in the iOS app's server setting. For your domain, add `api.nestic-app.com` as a custom domain and copy Railway's exact DNS target into your domain provider. Reserve `www.nestic-app.com` for a website later.
 6. Run **one API replica**. WebSocket fanout currently lives in memory within one process. Add Redis or another shared event bus before increasing replica count. Clients refresh when reconnecting to recover updates missed during restarts.
 
-Production startup refuses a missing or short JWT secret. Changing the secret signs everyone out. Tokens expire after seven days; users then sign in again. Configure PostgreSQL backups through your hosting provider before storing important data. Push notifications, background delivery while iOS suspends the app, email verification, and password recovery are not implemented in this version.
+Production startup refuses a missing or short JWT secret. Changing the secret signs everyone out. Tokens expire after seven days; users then sign in again. Configure PostgreSQL backups through your hosting provider before storing important data. The API rate-limits unauthenticated login, registration, and Apple authentication attempts in-process; keep Cloudflare/Railway edge limits enabled as well if the service is scaled beyond one replica. Users can permanently delete their account from **Your nest → Account data**; shared nests are transferred to another member when possible.
 
 ### Cloudflare R2 photos
 
@@ -82,7 +85,7 @@ The API must be public before a TestFlight build can support real accounts and s
    | `DATABASE_URL` | Reference the PostgreSQL service’s `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A new random value from `openssl rand -hex 32` |
-   | `APPLE_CLIENT_ID` | `com.bausch.Nestic-iOS` (the iOS app's bundle identifier) |
+   | `APPLE_CLIENT_IDS` | Comma-separated Apple audiences, for example `com.bausch.Nestic-iOS,com.example.nestic.web` |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
 
@@ -101,6 +104,7 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `POST /auth/register` | `{email,password,displayName,imageURL?}` → `{token}` |
 | `POST /auth/login` | HTTP Basic email/password → `{token}` |
 | `GET /auth/me` | Safe profile: `id,email,displayName,imageURL?,createdAt?,updatedAt?` |
+| `DELETE /auth/me` | Permanently delete the authenticated account and its private data; shared nests are transferred when possible |
 | `GET /nests`, `POST /nests` | List your nests; create with `{name}` |
 | `GET /nests/:id/members`, `POST /nests/:id/members` | List; add existing account with `{email,role}` |
 | `PATCH /nests/:id/members/:userID`, `DELETE /nests/:id/members/:userID` | Owner changes role or removes member; the last owner is protected |
@@ -112,8 +116,8 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `GET /entities/:id/pinned-actions`, `PUT /entities/:id/pinned-actions` | Read; replace pins with `{actionIds:[UUID]}` |
 | `GET /nests/:id/entities/summary` | Subjects, ordered pinned actions, and latest value for each |
 | `POST /entities/:id/events` | Log `{actionID,occurredAt?,valueNumber?,valueText?,valueBool?,valueJSON?,note?}` |
-| `GET /nests/:id/events?limit=200` | Shared feed, newest first; maximum 200 |
-| `GET /entities/:id/events?limit=200` | Subject feed, newest first; maximum 200 |
+| `GET /nests/:id/events?limit=200&before=<ISO date>` | Shared feed page, newest first; use `before` for older updates |
+| `GET /entities/:id/events?limit=200&before=<ISO date>` | Subject feed page, newest first; use `before` for older updates |
 | `DELETE /events/:id` | Logger or administrator deletes activity |
 
 `kind` is `person`, `pet`, `thing`, or `custom`. `valueType` is `none`, `number`, `text`, `boolean`, or `json`. Only supply the matching value field, or none for a simple occurrence. `valueJSON` is a string-to-string dictionary. Activity cannot be dated more than five minutes ahead of the server. Names are trimmed and limited to 100 characters; notes/text to 2,000.
