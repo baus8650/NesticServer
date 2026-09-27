@@ -1,5 +1,6 @@
 Packages
 .build
+.build-codex
 xcuserdata
 *.xcodeproj
 DerivedData/

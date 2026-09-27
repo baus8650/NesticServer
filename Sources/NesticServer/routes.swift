@@ -241,6 +241,57 @@ struct EntitySummaryDTO: Content {
     let pinned: [PinnedActionSummaryDTO]
 }
 
+struct RoutineResponse: Content {
+    let id: UUID
+    let nestId: UUID
+    let entityId: UUID
+    let name: String
+    let items: [RoutineItem]
+    let createdAt: Date?
+    let updatedAt: Date?
+}
+
+struct RoutineDeletedResponse: Content {
+    let id: UUID
+    let nestId: UUID
+}
+
+private func routineResponse(_ routine: Routine) throws -> RoutineResponse {
+    RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id, entityId: routine.$entity.id,
+                    name: routine.name, items: routine.items, createdAt: routine.createdAt,
+                    updatedAt: routine.updatedAt)
+}
+
+private func validateRoutineItems(_ items: [RoutineItem], entityID: UUID, nestID: UUID, on db: any Database) async throws {
+    guard !items.isEmpty, items.count <= 50, Set(items.map(\.trackerID)).count == items.count else {
+        throw Abort(.badRequest, reason: "Choose between one and 50 unique trackers for a routine.")
+    }
+
+    let trackerIDs = items.map(\.trackerID)
+    let actions = try await TrackableAction.query(on: db)
+        .filter(\.$id ~~ trackerIDs)
+        .all()
+    guard actions.count == items.count, actions.allSatisfy({ $0.$nest.id == nestID }) else {
+        throw Abort(.badRequest, reason: "Every routine tracker must belong to the same nest.")
+    }
+
+    let pinnedIDs = Set(try await EntityPinnedAction.query(on: db)
+        .filter(\.$entity.$id == entityID)
+        .filter(\.$action.$id ~~ trackerIDs)
+        .all()
+        .map { $0.$action.id })
+    guard pinnedIDs.count == items.count else {
+        throw Abort(.badRequest, reason: "Every routine tracker must be enabled for this subject.")
+    }
+
+    for item in items {
+        guard let action = actions.first(where: { $0.id == item.trackerID }) else { continue }
+        try InputValidation.event(type: action.valueType, number: item.valueNumber,
+                                  text: item.valueText, boolean: item.valueBool,
+                                  json: item.valueJSON, note: nil)
+    }
+}
+
 private func eventCursorDate(from req: Request) -> Date? {
     guard let raw = try? req.query.get(String.self, at: "before") else { return nil }
     let formatter = ISO8601DateFormatter()
@@ -1105,6 +1156,14 @@ func routes(_ app: Application) throws {
         try await req.db.transaction { tx in
             try await EntityPinnedAction.query(on: tx).filter(\.$action.$id == actionID).delete()
             try await ActionEvent.query(on: tx).filter(\.$action.$id == actionID).delete()
+            let routines = try await Routine.query(on: tx)
+                .filter(\.$nest.$id == nestID)
+                .all()
+            for routine in routines {
+                routine.items.removeAll { $0.trackerID == actionID }
+                if routine.items.isEmpty { try await routine.delete(on: tx) }
+                else { try await routine.save(on: tx) }
+            }
             try await action.delete(on: tx)
         }
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.deleted", data: deleted)
@@ -1215,6 +1274,172 @@ func routes(_ app: Application) throws {
         )
 
         return .noContent
+    }
+
+    // MARK: - Routines API
+
+    protected.get("nests", ":nestID", "routines") { req async throws -> [RoutineResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+
+        return try await Routine.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .sort(\.$createdAt, .ascending)
+            .all()
+            .map(routineResponse)
+    }
+
+    protected.post("nests", ":nestID", "routines") { req async throws -> RoutineResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+
+        struct CreateRoutineRequest: Content {
+            let entityID: UUID
+            let name: String
+            let items: [RoutineItem]
+        }
+        let input = try req.content.decode(CreateRoutineRequest.self)
+        guard let entity = try await Entity.find(input.entityID, on: req.db), entity.$nest.id == nestID else {
+            throw Abort(.badRequest, reason: "Subject not found in this nest.")
+        }
+        try await validateRoutineItems(input.items, entityID: input.entityID, nestID: nestID, on: req.db)
+
+        let routine = Routine(nestID: nestID, entityID: input.entityID,
+                              name: try InputValidation.name(input.name), items: input.items)
+        try await routine.save(on: req.db)
+        let response = try routineResponse(routine)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.created", data: response)
+        return response
+    }
+
+    protected.patch("routines", ":routineID") { req async throws -> RoutineResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let routineID = try req.parameters.require("routineID", as: UUID.self)
+        guard let routine = try await Routine.find(routineID, on: req.db) else {
+            throw Abort(.notFound, reason: "Routine not found")
+        }
+        let nestID = routine.$nest.id
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+
+        struct UpdateRoutineRequest: Content {
+            let name: String
+            let items: [RoutineItem]
+        }
+        let input = try req.content.decode(UpdateRoutineRequest.self)
+        try await validateRoutineItems(input.items, entityID: routine.$entity.id, nestID: nestID, on: req.db)
+        routine.name = try InputValidation.name(input.name)
+        routine.items = input.items
+        try await routine.save(on: req.db)
+        let response = try routineResponse(routine)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.updated", data: response)
+        return response
+    }
+
+    protected.delete("routines", ":routineID") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let routineID = try req.parameters.require("routineID", as: UUID.self)
+        guard let routine = try await Routine.find(routineID, on: req.db) else {
+            throw Abort(.notFound, reason: "Routine not found")
+        }
+        let nestID = routine.$nest.id
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+
+        try await routine.delete(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.deleted",
+                                              data: RoutineDeletedResponse(id: routineID, nestId: nestID))
+        return .noContent
+    }
+
+    protected.post("routines", ":routineID", "log") { req async throws -> [ActionEventResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let routineID = try req.parameters.require("routineID", as: UUID.self)
+        guard let routine = try await Routine.find(routineID, on: req.db) else {
+            throw Abort(.notFound, reason: "Routine not found")
+        }
+        let nestID = routine.$nest.id
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .filter(\.$role != .viewer)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "A member, administrator, or owner role is required to log updates")
+        }
+
+        struct LogRoutineRequest: Content {
+            let occurredAt: Date?
+            let note: String?
+        }
+        let input = try req.content.decode(LogRoutineRequest.self)
+        let occurredAt = input.occurredAt ?? Date()
+        guard occurredAt.timeIntervalSinceNow <= 300 else {
+            throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
+        }
+        try await validateRoutineItems(routine.items, entityID: routine.$entity.id, nestID: nestID, on: req.db)
+
+        let actions = try await TrackableAction.query(on: req.db)
+            .filter(\.$id ~~ routine.items.map(\.trackerID))
+            .all()
+        let cleanNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let events: [ActionEvent] = try await req.db.transaction { tx async throws -> [ActionEvent] in
+            var created: [ActionEvent] = []
+            for item in routine.items {
+                guard let action = actions.first(where: { $0.id == item.trackerID }) else {
+                    throw Abort(.badRequest, reason: "A routine tracker is no longer available.")
+                }
+                let event = ActionEvent(nestID: nestID, entityID: routine.$entity.id,
+                                        actionID: try action.requireID(), actorUserID: session.userId,
+                                        occurredAt: occurredAt, valueNumber: item.valueNumber,
+                                        valueText: item.valueText, valueBool: item.valueBool,
+                                        valueJSON: item.valueJSON,
+                                        note: cleanNote?.isEmpty == true ? nil : cleanNote)
+                try await event.save(on: tx)
+                created.append(event)
+            }
+            return created
+        }
+
+        let responses = try events.map { try $0.response() }
+        for response in responses {
+            req.application.realtimeHub.broadcast(nestId: nestID, type: "actionEvent.created", data: response)
+        }
+        return responses
     }
 
     // MARK: - Action Events API (for an Entity)
