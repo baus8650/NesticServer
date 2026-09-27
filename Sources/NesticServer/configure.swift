@@ -14,6 +14,10 @@ public func configure(_ app: Application) async throws {
     app.passwords.use(.bcrypt)
     app.http.server.configuration.hostname = "0.0.0.0"
     app.http.server.configuration.port = Environment.get("PORT").flatMap(Int.init) ?? 8080
+    // The browser client is hosted separately from the API in production. Vapor's
+    // origin-based configuration mirrors the requesting site without allowing
+    // credentialed wildcard access.
+    app.middleware.use(CORSMiddleware(configuration: .default()))
     // Subject avatars are compressed on-device before their binary upload to R2.
     app.routes.defaultMaxBodySize = "2mb"
 
@@ -25,6 +29,8 @@ public func configure(_ app: Application) async throws {
     } else {
         app.logger.warning("Cloudflare R2 photo storage is not configured; subject photo endpoints will return 503")
     }
+
+    _ = app.authRateLimiter
 
     if let databaseURL = Environment.get("DATABASE_URL") {
         let postgresConfiguration = try postgresConfiguration(for: databaseURL)
