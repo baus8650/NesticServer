@@ -26,6 +26,8 @@ actor AuthRateLimiter: Sendable {
     private let registerWindow: TimeInterval
     private let appleLimit: Int
     private let appleWindow: TimeInterval
+    private let recoveryLimit: Int
+    private let recoveryWindow: TimeInterval
 
     init() {
         // Conservative defaults that are still usable on a shared home or
@@ -36,6 +38,8 @@ actor AuthRateLimiter: Sendable {
         registerWindow = max(60, TimeInterval(Environment.get("AUTH_REGISTER_WINDOW_SECONDS") ?? "3600") ?? 3600)
         appleLimit = max(1, Int(Environment.get("AUTH_APPLE_LIMIT") ?? "12") ?? 12)
         appleWindow = max(10, TimeInterval(Environment.get("AUTH_APPLE_WINDOW_SECONDS") ?? "60") ?? 60)
+        recoveryLimit = max(1, Int(Environment.get("AUTH_RECOVERY_LIMIT") ?? "5") ?? 5)
+        recoveryWindow = max(60, TimeInterval(Environment.get("AUTH_RECOVERY_WINDOW_SECONDS") ?? "3600") ?? 3600)
     }
 
     func check(operation: String, key: String) -> Decision {
@@ -44,6 +48,7 @@ actor AuthRateLimiter: Sendable {
             switch operation {
             case "register": return (registerLimit, registerWindow)
             case "apple": return (appleLimit, appleWindow)
+            case "forgot", "reset", "resend", "verify": return (recoveryLimit, recoveryWindow)
             default: return (loginLimit, loginWindow)
             }
         }()
@@ -64,7 +69,8 @@ actor AuthRateLimiter: Sendable {
         if buckets.count > 10_000 {
             buckets = buckets.filter { entry in
                 let window = entry.key.hasPrefix("register:") ? registerWindow :
-                    (entry.key.hasPrefix("apple:") ? appleWindow : loginWindow)
+                    (entry.key.hasPrefix("apple:") ? appleWindow :
+                        (entry.key.hasPrefix("forgot:") || entry.key.hasPrefix("reset:") || entry.key.hasPrefix("resend:") || entry.key.hasPrefix("verify:") ? recoveryWindow : loginWindow))
                 return now.timeIntervalSince(entry.value.startedAt) < window
             }
         }
@@ -99,7 +105,7 @@ extension Request {
             var headers = HTTPHeaders()
             headers.replaceOrAdd(name: .retryAfter, value: String(decision.retryAfter))
             throw Abort(.tooManyRequests, headers: headers,
-                        reason: "Too many sign-in attempts. Please wait a moment and try again.")
+                        reason: "Too many requests. Please wait a moment and try again.")
         }
     }
 }

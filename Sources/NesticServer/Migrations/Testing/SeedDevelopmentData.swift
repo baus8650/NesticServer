@@ -17,7 +17,8 @@ struct SeedDevelopmentData: AsyncMigration {
             email: "test@nestic.local",
             passwordHash: passwordHash,
             displayName: "Test User",
-            imageURL: nil
+            imageURL: nil,
+            emailVerified: true
         )
         try await user.save(on: db)
 

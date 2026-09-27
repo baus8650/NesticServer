@@ -13,6 +13,7 @@ struct CreateUsers: AsyncMigration {
             .id()
             .field("email", .string, .required)
             .field("password_hash", .string, .required)
+            .field("email_verified", .bool, .required, .sql(.default(true)))
             .field("display_name", .string, .required)
             .field("image_url", .string)
             .field("created_at", .datetime)

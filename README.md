@@ -22,7 +22,7 @@ docker compose up --build
 
 In the iOS simulator, select `http://localhost:8080` as the API server. On a physical iPhone, use your Mac's LAN IP, such as `http://192.168.1.50:8080`, while on the same Wi-Fi network. For remote family testing, use the HTTPS Railway URL.
 
-Create an account in the app. To share a nest, the other person first creates their own account on the same server; an owner or administrator then adds their email from the nest's members screen. This adds an existing account immediately. No invitation email or password reset email is sent.
+Create an account in the app. Password accounts receive a verification email before they can sign in; Apple accounts are verified by Apple. To share a nest, the other person first creates their own account on the same server; an owner or administrator then adds their email from the nest's members screen. Password reset links are delivered by Resend.
 
 Sample database data is opt-in: use `SEED_DEMO_DATA=true swift run NesticServer migrate --yes` in development. That creates the legacy `test@nestic.local` / `password` account. Do not enable it on a hosted service. The app's local demo is independent of this database.
 
@@ -93,7 +93,7 @@ The API must be public before a TestFlight build can support real accounts and s
 4. Optionally point `api.nestic-app.com` at the Railway domain. The iOS Release configuration currently uses `https://api.nestic-app.com`; if you use the generated Railway URL instead, change the Release `NESTIC_SERVER_URL` setting before archiving the TestFlight build.
 5. In Apple Developer, enable the **Sign in with Apple** capability for the `com.bausch.Nestic-iOS` App ID, then refresh the app's signing profiles in Xcode. The iOS project includes the entitlement and the API verifies Apple's identity token server-side. Existing email/password users can sign in normally and link Apple from **Settings → Account security**; new users can use Apple directly. Do not enable `SEED_DEMO_DATA` on the hosted service. The sample nest in the iOS app is local-only and is not a hosted account.
 
-The API does not currently send email invitations. For the first beta, share the TestFlight link separately, have each tester register inside Nestic, and add their registered email from the nest’s member controls. Email verification, password recovery, push notifications, and background delivery are follow-up production work.
+The API does not send email invitations. For the first beta, share the TestFlight link separately, have each tester register inside Nestic, and add their registered email from the nest’s member controls. Email verification and password recovery use Resend. Configure and verify `nestic-app.com` in Resend, then add `RESEND_API_KEY`, `RESEND_FROM`, `API_PUBLIC_URL`, and `WEB_APP_URL` to the Railway API service. The API applies process-local limits to registration and recovery endpoints; add an edge CAPTCHA/rate limit such as Cloudflare Turnstile and Cloudflare rate limiting before a public launch if you need stronger bot resistance.
 
 ## API contract
 
@@ -101,8 +101,12 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 
 | Endpoint | Behavior |
 | --- | --- |
-| `POST /auth/register` | `{email,password,displayName,imageURL?}` → `{token}` |
+| `POST /auth/register` | `{email,password,displayName,imageURL?}` → `{requiresEmailVerification:true}` and sends a verification email |
 | `POST /auth/login` | HTTP Basic email/password → `{token}` |
+| `GET /auth/verify?token=...` | Verify a one-time email token and show a confirmation page |
+| `POST /auth/resend-verification` | `{email}` → generic response; sends a fresh verification email when appropriate |
+| `POST /auth/forgot-password` | `{email}` → generic response; sends a one-hour reset link when appropriate |
+| `POST /auth/reset-password` | `{token,password}` → confirms the new password |
 | `GET /auth/me` | Safe profile: `id,email,displayName,imageURL?,createdAt?,updatedAt?` |
 | `DELETE /auth/me` | Permanently delete the authenticated account and its private data; shared nests are transferred when possible |
 | `GET /nests`, `POST /nests` | List your nests; create with `{name}` |

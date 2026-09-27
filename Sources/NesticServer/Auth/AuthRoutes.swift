@@ -1,6 +1,8 @@
 import Vapor
 import JWT
 import Fluent
+import Crypto
+import Foundation
 
 struct SessionToken: Content, Authenticatable, JWTPayload {
     static let expirationTime: TimeInterval = 60 * 60 * 24 * 7
@@ -21,6 +23,29 @@ struct SessionToken: Content, Authenticatable, JWTPayload {
 
 struct TokenResponse: Content { let token: String }
 
+struct RegisterResponse: Content {
+    let token: String?
+    let requiresEmailVerification: Bool
+
+    init(token: String? = nil, requiresEmailVerification: Bool) {
+        self.token = token
+        self.requiresEmailVerification = requiresEmailVerification
+    }
+}
+
+struct AuthMessageResponse: Content {
+    let message: String
+}
+
+struct EmailRequest: Content {
+    let email: String
+}
+
+struct ResetPasswordRequest: Content {
+    let token: String
+    let password: String
+}
+
 struct UserResponse: Content {
     let id: UUID
     let email: String
@@ -29,6 +54,7 @@ struct UserResponse: Content {
     let createdAt: Date?
     let updatedAt: Date?
     let appleLinked: Bool
+    let emailVerified: Bool
 
     init(_ user: User) throws {
         id = try user.requireID()
@@ -38,6 +64,7 @@ struct UserResponse: Content {
         createdAt = user.createdAt
         updatedAt = user.updatedAt
         appleLinked = user.appleSubject != nil
+        emailVerified = user.emailVerified
     }
 }
 
@@ -108,8 +135,40 @@ private func appleDisplayName(_ input: AppleSignInRequest, email: String?) -> St
     return "Apple user"
 }
 
+private func authTokenValue() -> String {
+    var generator = SystemRandomNumberGenerator()
+    let bytes = (0..<32).map { _ in UInt8.random(in: 0...UInt8.max, using: &generator) }
+    return Data(bytes).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+
+private func authTokenHash(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
+private func makeAuthToken(for user: User, kind: AuthToken.Kind, lifetime: TimeInterval, on db: any Database) async throws -> (String, AuthToken) {
+    let userID = try user.requireID()
+    let existing = try await AuthToken.query(on: db)
+        .filter(\.$userID == userID)
+        .filter(\.$kind == kind.rawValue)
+        .all()
+    for token in existing { try await token.delete(on: db) }
+    let value = authTokenValue()
+    let token = AuthToken(userID: userID, kind: kind, tokenHash: authTokenHash(value), expiresAt: Date().addingTimeInterval(lifetime))
+    return (value, token)
+}
+
+private func htmlResponse(title: String, message: String) -> Response {
+    var headers = HTTPHeaders()
+    headers.replaceOrAdd(name: .contentType, value: "text/html; charset=utf-8")
+    let html = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>\(title)</title></head><body style=\"margin:0;background:#f5f1e8;color:#183b2c;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif\"><main style=\"max-width:560px;margin:48px auto;padding:36px;background:#fffdf8;border:1px solid #ded8cb;border-radius:18px\"><div style=\"font-size:26px;font-weight:800\">nestic</div><h1>\(title)</h1><p style=\"font-size:17px;line-height:1.6\">\(message)</p><p>You can close this window and return to Nestic.</p></main></body></html>"
+    return Response(status: .ok, headers: headers, body: .init(string: html))
+}
+
 func authRoutes(_ app: Application) throws {
-    app.post("auth", "register") { req async throws -> TokenResponse in
+    app.post("auth", "register") { req async throws -> RegisterResponse in
         try await req.enforceAuthRateLimit(operation: "register")
         let input = try req.content.decode(RegisterRequest.self)
         let email = try InputValidation.email(input.email)
@@ -124,7 +183,23 @@ func authRoutes(_ app: Application) throws {
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "Email already in use.")
         }
-        return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
+        // Integration tests intentionally avoid an external email provider.
+        // Production and development accounts always take the verification path.
+        if req.application.environment == .testing {
+            user.emailVerified = true
+            try await user.save(on: req.db)
+            return RegisterResponse(token: try await req.jwt.sign(SessionToken(with: user)), requiresEmailVerification: false)
+        }
+        let (value, token) = try await makeAuthToken(for: user, kind: .emailVerification, lifetime: 60 * 60 * 24, on: req.db)
+        try await token.save(on: req.db)
+        do {
+            try await NesticEmailService.sendVerification(on: req, to: email, displayName: displayName, token: value)
+        } catch {
+            try? await token.delete(on: req.db)
+            try? await user.delete(on: req.db)
+            throw error
+        }
+        return RegisterResponse(requiresEmailVerification: true)
     }
 
     // HTTP Basic authentication, with case-insensitive account email normalization.
@@ -136,6 +211,9 @@ func authRoutes(_ app: Application) throws {
               try await req.password.async.verify(credentials.password, created: user.passwordHash) else {
             throw Abort(.unauthorized, reason: "Email or password is incorrect.")
         }
+        guard user.emailVerified else {
+            throw Abort(.forbidden, reason: "Please verify your email address before signing in. Check your inbox for the verification link.")
+        }
         return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
     }
 
@@ -146,6 +224,10 @@ func authRoutes(_ app: Application) throws {
 
         if let existing = try await User.query(on: req.db)
             .filter(\.$appleSubject == identity.subject.value).first() {
+            if !existing.emailVerified {
+                existing.emailVerified = true
+                try await existing.save(on: req.db)
+            }
             return TokenResponse(token: try await req.jwt.sign(SessionToken(with: existing)))
         }
 
@@ -161,13 +243,81 @@ func authRoutes(_ app: Application) throws {
             email: email,
             passwordHash: try await req.password.async.hash(UUID().uuidString),
             displayName: appleDisplayName(input, email: email),
-            appleSubject: identity.subject.value
+            appleSubject: identity.subject.value,
+            emailVerified: true
         )
         do { try await user.save(on: req.db) }
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "That Apple account is already in use.")
         }
         return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
+    }
+
+    app.get("auth", "verify") { req async throws -> Response in
+        guard let value = try? req.query.get(String.self, at: "token"), !value.isEmpty,
+              let token = try await AuthToken.query(on: req.db)
+                .filter(\.$tokenHash == authTokenHash(value))
+                .filter(\.$kind == AuthToken.Kind.emailVerification.rawValue)
+                .first(), token.usedAt == nil, token.expiresAt > Date(),
+              let user = try await User.find(token.userID, on: req.db) else {
+            return htmlResponse(title: "This verification link is no longer valid", message: "Request a new verification email from the Nestic sign-in screen and try again.")
+        }
+        user.emailVerified = true
+        token.usedAt = Date()
+        try await user.save(on: req.db)
+        try await token.save(on: req.db)
+        return htmlResponse(title: "Email verified", message: "Your Nestic account is ready. Return to the app or website and sign in.")
+    }
+
+    app.post("auth", "resend-verification") { req async throws -> AuthMessageResponse in
+        try await req.enforceAuthRateLimit(operation: "resend")
+        let input = try req.content.decode(EmailRequest.self)
+        let email = try InputValidation.email(input.email)
+        if let user = try await User.query(on: req.db).filter(\.$email == email).first(), !user.emailVerified {
+            do {
+                let (value, token) = try await makeAuthToken(for: user, kind: .emailVerification, lifetime: 60 * 60 * 24, on: req.db)
+                try await token.save(on: req.db)
+                try await NesticEmailService.sendVerification(on: req, to: user.email, displayName: user.displayName, token: value)
+            } catch {
+                req.logger.error("Could not resend verification email", metadata: ["error": .string(String(describing: error))])
+            }
+        }
+        return AuthMessageResponse(message: "If that email has an unverified Nestic account, a new verification link is on its way.")
+    }
+
+    app.post("auth", "forgot-password") { req async throws -> AuthMessageResponse in
+        try await req.enforceAuthRateLimit(operation: "forgot")
+        let input = try req.content.decode(EmailRequest.self)
+        let email = try InputValidation.email(input.email)
+        if let user = try await User.query(on: req.db).filter(\.$email == email).first(), user.emailVerified {
+            do {
+                let (value, token) = try await makeAuthToken(for: user, kind: .passwordReset, lifetime: 60 * 60, on: req.db)
+                try await token.save(on: req.db)
+                try await NesticEmailService.sendPasswordReset(on: req, to: user.email, displayName: user.displayName, token: value)
+            } catch {
+                req.logger.error("Could not send password reset email", metadata: ["error": .string(String(describing: error))])
+            }
+        }
+        return AuthMessageResponse(message: "If an account exists for that email, a password reset link is on its way.")
+    }
+
+    app.post("auth", "reset-password") { req async throws -> AuthMessageResponse in
+        try await req.enforceAuthRateLimit(operation: "reset")
+        let input = try req.content.decode(ResetPasswordRequest.self)
+        guard !input.token.isEmpty else { throw Abort(.badRequest, reason: "That password reset link is not valid.") }
+        try InputValidation.password(input.password)
+        guard let token = try await AuthToken.query(on: req.db)
+            .filter(\.$tokenHash == authTokenHash(input.token))
+            .filter(\.$kind == AuthToken.Kind.passwordReset.rawValue)
+            .first(), token.usedAt == nil, token.expiresAt > Date(),
+              let user = try await User.find(token.userID, on: req.db) else {
+            throw Abort(.badRequest, reason: "That password reset link is expired or invalid. Request a new one.")
+        }
+        user.passwordHash = try await req.password.async.hash(input.password)
+        token.usedAt = Date()
+        try await user.save(on: req.db)
+        try await token.save(on: req.db)
+        return AuthMessageResponse(message: "Your password was changed. You can sign in now.")
     }
 
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
@@ -184,6 +334,7 @@ func authRoutes(_ app: Application) throws {
             throw Abort(.conflict, reason: "That Apple account is already linked to another Nestic account.")
         }
         user.appleSubject = identity.subject.value
+        user.emailVerified = true
         try await user.save(on: req.db)
         return try UserResponse(user)
     }
@@ -249,6 +400,9 @@ func authRoutes(_ app: Application) throws {
                 }
             }
 
+            try await AuthToken.query(on: tx)
+                .filter(\.$userID == session.userId)
+                .delete()
             try await user.delete(on: tx)
         }
 

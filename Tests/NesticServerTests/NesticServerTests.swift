@@ -112,7 +112,7 @@ struct PostgresIntegrationTests {
                     try req.content.encode(RegisterRequest(email: "\(name)-\(suffix)@example.com", password: "test-password", displayName: name, imageURL: nil))
                 })
                 #expect(response.status == .ok)
-                let token = try response.content.decode(TokenResponse.self).token
+                let token = try #require(response.content.decode(RegisterResponse.self).token)
                 tokens.append(token)
                 let profile = try await api.sendRequest(.GET, "auth/me", headers: ["Authorization": "Bearer \(token)"])
                 #expect(!profile.body.string.contains("password"))
