@@ -40,6 +40,7 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A randomly generated secret of at least 32 bytes; generate one with `openssl rand -hex 32` |
    | `APPLE_CLIENT_IDS` | Comma-separated Apple audiences, for example `com.bausch.Nestic-iOS,com.example.nestic.web` |
+   | `NESTIC_MANUAL_PRO_EMAILS` | Optional comma-separated account emails to unlock Pro manually for testing/support |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
    | `R2_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com` |

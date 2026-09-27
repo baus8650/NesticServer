@@ -138,6 +138,7 @@ struct TrackableActionResponse: Content {
     let unit: String?
     let symbol: String?
     let color: String?
+    let groupName: String?
     let description: String?
     let createdAt: Date?
     let updatedAt: Date?
@@ -947,6 +948,7 @@ func routes(_ app: Application) throws {
                 unit: a.unit,
                 symbol: a.symbol,
                 color: a.color,
+                groupName: a.groupName,
                 description: a.description,
                 createdAt: a.createdAt,
                 updatedAt: a.updatedAt
@@ -982,12 +984,16 @@ func routes(_ app: Application) throws {
             let unit: String?
             let symbol: String?
             let color: String?
+            let groupName: String?
             let description: String?
         }
 
         let input = try req.content.decode(CreateActionRequest.self)
         let symbol = try InputValidation.trackerSymbol(input.symbol)
         let color = try InputValidation.trackerColor(input.color)
+        let groupName = input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
 
         let action = TrackableAction(
             nestID: nestID,
@@ -996,6 +1002,7 @@ func routes(_ app: Application) throws {
             unit: input.unit,
             symbol: symbol,
             color: color,
+            groupName: groupName,
             description: input.description
         )
 
@@ -1011,6 +1018,7 @@ func routes(_ app: Application) throws {
             unit: action.unit,
             symbol: action.symbol,
             color: action.color,
+            groupName: action.groupName,
             description: action.description,
             createdAt: action.createdAt,
             updatedAt: action.updatedAt
@@ -1049,6 +1057,7 @@ func routes(_ app: Application) throws {
             let unit: String?
             let symbol: String?
             let color: String?
+            let groupName: String?
             let description: String?
         }
         let input = try req.content.decode(UpdateActionRequest.self)
@@ -1058,6 +1067,8 @@ func routes(_ app: Application) throws {
         if action.valueType != .number { action.unit = nil }
         if let symbol = input.symbol { action.symbol = try InputValidation.trackerSymbol(symbol) }
         if let color = input.color { action.color = try InputValidation.trackerColor(color) }
+        let trimmedGroupName = input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        action.groupName = trimmedGroupName.isEmpty ? nil : trimmedGroupName
         if let description = input.description { action.description = description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : description }
         try await action.save(on: req.db)
 
@@ -1065,6 +1076,7 @@ func routes(_ app: Application) throws {
                                                valueType: action.valueType, unit: action.unit,
                                                symbol: action.symbol,
                                                color: action.color,
+                                               groupName: action.groupName,
                                                description: action.description, createdAt: action.createdAt,
                                                updatedAt: action.updatedAt)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)

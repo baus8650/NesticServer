@@ -40,6 +40,9 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
     @OptionalField(key: "color")
     var color: String? // a six-digit hex color chosen by the user
 
+    @OptionalField(key: "group_name")
+    var groupName: String? // e.g. "Medication" for related medicine trackers
+
     @OptionalField(key: "description")
     var description: String?
 
@@ -51,7 +54,7 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
 
     init() {}
 
-    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, symbol: String? = nil, color: String? = nil, description: String? = nil) {
+    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, symbol: String? = nil, color: String? = nil, groupName: String? = nil, description: String? = nil) {
         self.id = id
         self.$nest.id = nestID
         self.name = name
@@ -59,6 +62,7 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
         self.unit = unit
         self.symbol = symbol
         self.color = color
+        self.groupName = groupName
         self.description = description
     }
 }
