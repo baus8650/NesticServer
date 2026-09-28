@@ -143,7 +143,7 @@ struct PostgresIntegrationTests {
             let api = try app.testing()
             let suffix = UUID().uuidString.lowercased()
             var tokens: [String] = []
-            for name in ["owner", "member", "outsider"] {
+            for name in ["owner", "member", "outsider", "coowner"] {
                 let response = try await api.sendRequest(.POST, "auth/register", beforeRequest: { req async throws in
                     try req.content.encode(RegisterRequest(email: "\(name)-\(suffix)@example.com", password: "test-password", displayName: name, imageURL: nil))
                 })
@@ -157,6 +157,7 @@ struct PostgresIntegrationTests {
             let owner: HTTPHeaders = ["Authorization": "Bearer \(tokens[0])"]
             let member: HTTPHeaders = ["Authorization": "Bearer \(tokens[1])"]
             let outsider: HTTPHeaders = ["Authorization": "Bearer \(tokens[2])"]
+            let coowner: HTTPHeaders = ["Authorization": "Bearer \(tokens[3])"]
             let nestResponse = try await api.sendRequest(.POST, "nests", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["name": "Integration nest"])
             })
@@ -189,6 +190,15 @@ struct PostgresIntegrationTests {
             let routineResponse = try routine.content.decode(RoutineResponse.self)
             #expect(routineResponse.items.count == 1)
             #expect(routineResponse.targets.count == 1)
+            let addedOwner = try await api.sendRequest(.POST, "nests/\(nest.id)/members", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(["email": "coowner-\(suffix)@example.com", "role": "owner"])
+            })
+            #expect(addedOwner.status == .ok)
+            #expect(try addedOwner.content.decode(MemberResponse.self).role == .owner)
+            let ownerCanManage = try await api.sendRequest(.PATCH, "actions/\(action.id)", headers: coowner, beforeRequest: { req async throws in
+                try req.content.encode(["name": "Bathroom break", "valueType": "boolean"])
+            })
+            #expect(ownerCanManage.status == .ok)
             let added = try await api.sendRequest(.POST, "nests/\(nest.id)/members", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["email": "member-\(suffix)@example.com", "role": "viewer"])
             })

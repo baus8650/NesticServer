@@ -111,7 +111,7 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `GET /auth/me` | Safe profile: `id,email,displayName,imageURL?,createdAt?,updatedAt?` |
 | `DELETE /auth/me` | Permanently delete the authenticated account and its private data; shared nests are transferred when possible |
 | `GET /nests`, `POST /nests` | List your nests; create with `{name}` |
-| `GET /nests/:id/members`, `POST /nests/:id/members` | List; add existing account with `{email,role}` |
+| `GET /nests/:id/members`, `POST /nests/:id/members` | List; add existing account with `{email,role}`; nests may have multiple equal owners |
 | `PATCH /nests/:id/members/:userID`, `DELETE /nests/:id/members/:userID` | Owner changes role or removes member; the last owner is protected |
 | `GET /nests/:id/entities`, `POST /nests/:id/entities` | List; create `{kind,name,tags?,metadata?,birthday?,imageURL?}` |
 | `PATCH /entities/:id`, `DELETE /entities/:id` | Edit; remove subject and its activity |
