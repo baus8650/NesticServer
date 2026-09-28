@@ -1357,7 +1357,7 @@ func routes(_ app: Application) throws {
         let input = try req.content.decode(UpdateRoutineRequest.self)
         try await validateRoutineItems(input.items, entityID: routine.$entity.id, nestID: nestID, on: req.db)
         routine.name = try InputValidation.name(input.name)
-        routine.items = input.items
+        routine.items = RoutineItems(input.items)
         try await routine.save(on: req.db)
         let response = try routineResponse(routine)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.updated", data: response)

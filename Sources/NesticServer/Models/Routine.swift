@@ -19,12 +19,12 @@ struct RoutineItems: Codable, Hashable, Sendable {
         self.values = values
     }
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
         values = try container.decode([RoutineItem].self)
     }
 
-    func encode(to encoder: Encoder) throws {
+    func encode(to encoder: any Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encode(values)
     }
