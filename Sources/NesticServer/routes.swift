@@ -247,6 +247,7 @@ struct RoutineResponse: Content {
     let entityId: UUID
     let name: String
     let items: [RoutineItem]
+    let targets: [RoutineTarget]
     let createdAt: Date?
     let updatedAt: Date?
 }
@@ -257,9 +258,40 @@ struct RoutineDeletedResponse: Content {
 }
 
 private func routineResponse(_ routine: Routine) throws -> RoutineResponse {
-    RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id, entityId: routine.$entity.id,
-                    name: routine.name, items: routine.items.values, createdAt: routine.createdAt,
+    let targets = routineTargets(routine)
+    return RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id,
+                    entityId: targets[0].entityID, name: routine.name, items: targets[0].items,
+                    targets: targets, createdAt: routine.createdAt,
                     updatedAt: routine.updatedAt)
+}
+
+private func routineTargets(_ routine: Routine) -> [RoutineTarget] {
+    if let targets = routine.targets?.values, !targets.isEmpty {
+        return targets
+    }
+    return [RoutineTarget(entityID: routine.$entity.id, items: routine.items.values)]
+}
+
+private func validateRoutineTargets(_ targets: [RoutineTarget], nestID: UUID, on db: any Database) async throws {
+    let entityIDs = targets.map(\.entityID)
+    guard !targets.isEmpty, entityIDs.count <= 50, Set(entityIDs).count == entityIDs.count else {
+        throw Abort(.badRequest, reason: "Choose at least one unique entity for a routine.")
+    }
+
+    let entities = try await Entity.query(on: db)
+        .filter(\.$id ~~ entityIDs)
+        .all()
+    guard entities.count == entityIDs.count, entities.allSatisfy({ $0.$nest.id == nestID }) else {
+        throw Abort(.badRequest, reason: "Every routine entity must belong to the same nest.")
+    }
+
+    let itemCount = targets.reduce(0) { $0 + $1.items.count }
+    guard itemCount <= 50 else {
+        throw Abort(.badRequest, reason: "Choose no more than 50 total trackers for a routine.")
+    }
+    for target in targets {
+        try await validateRoutineItems(target.items, entityID: target.entityID, nestID: nestID, on: db)
+    }
 }
 
 private func validateRoutineItems(_ items: [RoutineItem], entityID: UUID, nestID: UUID, on db: any Database) async throws {
@@ -952,6 +984,21 @@ func routes(_ app: Application) throws {
             try await ActionEvent.query(on: tx)
                 .filter(\.$entity.$id == entityID)
                 .delete()
+            let routines = try await Routine.query(on: tx)
+                .filter(\.$nest.$id == nestID)
+                .all()
+            for routine in routines {
+                let remainingTargets = routineTargets(routine).filter { $0.entityID != entityID }
+                guard remainingTargets.count != routineTargets(routine).count else { continue }
+                if remainingTargets.isEmpty {
+                    try await routine.delete(on: tx)
+                } else {
+                    routine.$entity.id = remainingTargets[0].entityID
+                    routine.items = RoutineItems(remainingTargets[0].items)
+                    routine.targets = RoutineTargets(remainingTargets)
+                    try await routine.save(on: tx)
+                }
+            }
 
             try await entity.delete(on: tx)
         }
@@ -1160,11 +1207,21 @@ func routes(_ app: Application) throws {
                 .filter(\.$nest.$id == nestID)
                 .all()
             for routine in routines {
-                var itemContainer = routine.items
-                itemContainer.values.removeAll { $0.trackerID == actionID }
-                routine.items = itemContainer
-                if routine.items.values.isEmpty { try await routine.delete(on: tx) }
-                else { try await routine.save(on: tx) }
+                let existingTargets = routineTargets(routine)
+                let remainingTargets = existingTargets.compactMap { target -> RoutineTarget? in
+                    let items = target.items.filter { $0.trackerID != actionID }
+                    return items.isEmpty ? nil : RoutineTarget(entityID: target.entityID, items: items)
+                }
+                if remainingTargets.isEmpty {
+                    try await routine.delete(on: tx)
+                } else if remainingTargets != existingTargets || routine.targets != nil {
+                    routine.$entity.id = remainingTargets[0].entityID
+                    routine.items = RoutineItems(remainingTargets[0].items)
+                    routine.targets = routine.targets == nil && remainingTargets.count == 1
+                        ? nil
+                        : RoutineTargets(remainingTargets)
+                    try await routine.save(on: tx)
+                }
             }
             try await action.delete(on: tx)
         }
@@ -1313,18 +1370,23 @@ func routes(_ app: Application) throws {
         }
 
         struct CreateRoutineRequest: Content {
-            let entityID: UUID
+            let entityID: UUID?
             let name: String
-            let items: [RoutineItem]
+            let items: [RoutineItem]?
+            let targets: [RoutineTarget]?
         }
         let input = try req.content.decode(CreateRoutineRequest.self)
-        guard let entity = try await Entity.find(input.entityID, on: req.db), entity.$nest.id == nestID else {
-            throw Abort(.badRequest, reason: "Subject not found in this nest.")
+        let selectedTargets: [RoutineTarget]
+        if let targets = input.targets {
+            selectedTargets = targets
+        } else if let entityID = input.entityID, let items = input.items {
+            selectedTargets = [RoutineTarget(entityID: entityID, items: items)]
+        } else {
+            throw Abort(.badRequest, reason: "Choose at least one entity and tracker for this routine.")
         }
-        try await validateRoutineItems(input.items, entityID: input.entityID, nestID: nestID, on: req.db)
+        try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
 
-        let routine = Routine(nestID: nestID, entityID: input.entityID,
-                              name: try InputValidation.name(input.name), items: input.items)
+        let routine = Routine(nestID: nestID, name: try InputValidation.name(input.name), targets: selectedTargets)
         try await routine.save(on: req.db)
         let response = try routineResponse(routine)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.created", data: response)
@@ -1352,12 +1414,23 @@ func routes(_ app: Application) throws {
 
         struct UpdateRoutineRequest: Content {
             let name: String
-            let items: [RoutineItem]
+            let items: [RoutineItem]?
+            let targets: [RoutineTarget]?
         }
         let input = try req.content.decode(UpdateRoutineRequest.self)
-        try await validateRoutineItems(input.items, entityID: routine.$entity.id, nestID: nestID, on: req.db)
+        let selectedTargets: [RoutineTarget]
+        if let targets = input.targets {
+            selectedTargets = targets
+        } else if let items = input.items {
+            selectedTargets = [RoutineTarget(entityID: routine.$entity.id, items: items)]
+        } else {
+            throw Abort(.badRequest, reason: "Choose at least one entity and tracker for this routine.")
+        }
+        try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
         routine.name = try InputValidation.name(input.name)
-        routine.items = RoutineItems(input.items)
+        routine.$entity.id = selectedTargets[0].entityID
+        routine.items = RoutineItems(selectedTargets[0].items)
+        routine.targets = RoutineTargets(selectedTargets)
         try await routine.save(on: req.db)
         let response = try routineResponse(routine)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.updated", data: response)
@@ -1413,26 +1486,29 @@ func routes(_ app: Application) throws {
         guard occurredAt.timeIntervalSinceNow <= 300 else {
             throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
         }
-        try await validateRoutineItems(routine.items.values, entityID: routine.$entity.id, nestID: nestID, on: req.db)
-
+        let targets = routineTargets(routine)
+        try await validateRoutineTargets(targets, nestID: nestID, on: req.db)
+        let trackerIDs = Array(Set(targets.flatMap { $0.items.map(\.trackerID) }))
         let actions = try await TrackableAction.query(on: req.db)
-            .filter(\.$id ~~ routine.items.values.map(\.trackerID))
+            .filter(\.$id ~~ trackerIDs)
             .all()
         let cleanNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let events: [ActionEvent] = try await req.db.transaction { tx async throws -> [ActionEvent] in
             var created: [ActionEvent] = []
-            for item in routine.items.values {
-                guard let action = actions.first(where: { $0.id == item.trackerID }) else {
-                    throw Abort(.badRequest, reason: "A routine tracker is no longer available.")
+            for target in targets {
+                for item in target.items {
+                    guard let action = actions.first(where: { $0.id == item.trackerID }) else {
+                        throw Abort(.badRequest, reason: "A routine tracker is no longer available.")
+                    }
+                    let event = ActionEvent(nestID: nestID, entityID: target.entityID,
+                                            actionID: try action.requireID(), actorUserID: session.userId,
+                                            occurredAt: occurredAt, valueNumber: item.valueNumber,
+                                            valueText: item.valueText, valueBool: item.valueBool,
+                                            valueJSON: item.valueJSON,
+                                            note: cleanNote?.isEmpty == true ? nil : cleanNote)
+                    try await event.save(on: tx)
+                    created.append(event)
                 }
-                let event = ActionEvent(nestID: nestID, entityID: routine.$entity.id,
-                                        actionID: try action.requireID(), actorUserID: session.userId,
-                                        occurredAt: occurredAt, valueNumber: item.valueNumber,
-                                        valueText: item.valueText, valueBool: item.valueBool,
-                                        valueJSON: item.valueJSON,
-                                        note: cleanNote?.isEmpty == true ? nil : cleanNote)
-                try await event.save(on: tx)
-                created.append(event)
             }
             return created
         }

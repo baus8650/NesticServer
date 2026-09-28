@@ -98,6 +98,20 @@ struct NesticServerTests {
         #expect(try JSONDecoder().decode(RoutineItems.self, from: encoded).values == items)
     }
 
+    @Test("Routine targets preserve multiple entities in one JSON document")
+    func routineTargetsUseJSONDocument() throws {
+        let first = RoutineTarget(entityID: UUID(), items: [
+            RoutineItem(trackerID: UUID(), valueNumber: 2, valueText: nil, valueBool: nil, valueJSON: nil)
+        ])
+        let second = RoutineTarget(entityID: UUID(), items: [
+            RoutineItem(trackerID: UUID(), valueNumber: nil, valueText: nil, valueBool: true, valueJSON: nil)
+        ])
+        let encoded = try JSONEncoder().encode(RoutineTargets([first, second]))
+        let json = try JSONSerialization.jsonObject(with: encoded)
+        #expect(json is [Any])
+        #expect(try JSONDecoder().decode(RoutineTargets.self, from: encoded).values == [first, second])
+    }
+
     @Test("Public profile never serializes a password hash")
     func publicProfile() throws {
         let user = User(email: "person@example.com", passwordHash: "private-hash", displayName: "Alex")
@@ -166,7 +180,9 @@ struct PostgresIntegrationTests {
                 ))
             })
             #expect(routine.status == .ok)
-            #expect(try routine.content.decode(RoutineResponse.self).items.count == 1)
+            let routineResponse = try routine.content.decode(RoutineResponse.self)
+            #expect(routineResponse.items.count == 1)
+            #expect(routineResponse.targets.count == 1)
             let added = try await api.sendRequest(.POST, "nests/\(nest.id)/members", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["email": "member-\(suffix)@example.com", "role": "viewer"])
             })

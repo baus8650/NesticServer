@@ -61,6 +61,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateActionEvents())
     app.migrations.add(CreateEntityPinnedActions())
     app.migrations.add(CreateRoutines())
+    app.migrations.add(AddRoutineTargets())
     app.migrations.add(AddPerformanceIndexes())
     // Real deployments and clean local accounts should never receive sample family data.
     if app.environment == .development && Environment.get("SEED_DEMO_DATA") == "true" {

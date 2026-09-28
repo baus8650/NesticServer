@@ -9,6 +9,11 @@ struct RoutineItem: Codable, Content, Hashable, Sendable {
     let valueJSON: [String: String]?
 }
 
+struct RoutineTarget: Codable, Content, Hashable, Sendable {
+    let entityID: UUID
+    let items: [RoutineItem]
+}
+
 /// Postgres must receive the routine item list as one JSON document, not as a
 /// native array of JSON values (jsonb[]). The wrapper preserves the API's
 /// array representation while making Fluent bind the field as a single jsonb.
@@ -22,6 +27,24 @@ struct RoutineItems: Codable, Hashable, Sendable {
     init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
         values = try container.decode([RoutineItem].self)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(values)
+    }
+}
+
+struct RoutineTargets: Codable, Hashable, Sendable {
+    var values: [RoutineTarget]
+
+    init(_ values: [RoutineTarget] = []) {
+        self.values = values
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        values = try container.decode([RoutineTarget].self)
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -48,6 +71,9 @@ final class Routine: Model, Content, @unchecked Sendable {
     @Field(key: "items")
     var items: RoutineItems
 
+    @OptionalField(key: "targets")
+    var targets: RoutineTargets?
+
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
 
@@ -62,5 +88,15 @@ final class Routine: Model, Content, @unchecked Sendable {
         self.$entity.id = entityID
         self.name = name
         self.items = RoutineItems(items)
+        self.targets = nil
+    }
+
+    init(id: UUID? = nil, nestID: UUID, name: String, targets: [RoutineTarget]) {
+        self.id = id
+        self.$nest.id = nestID
+        self.$entity.id = targets[0].entityID
+        self.name = name
+        self.items = RoutineItems(targets[0].items)
+        self.targets = RoutineTargets(targets)
     }
 }
