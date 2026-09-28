@@ -126,6 +126,7 @@ struct EntityResponse: Content {
     let metadata: [String: String]?
     let birthday: Date?
     let imageURL: String?
+    let pinnedActionIDs: [UUID] = []
     let createdAt: Date?
     let updatedAt: Date?
 }
@@ -695,6 +696,18 @@ func routes(_ app: Application) throws {
             .filter(\.$nest.$id == nestID)
             .all()
 
+        let entityIDs = entities.compactMap(\.id)
+        var pinsByEntity: [UUID: [UUID]] = [:]
+        if !entityIDs.isEmpty {
+            let pins = try await EntityPinnedAction.query(on: req.db)
+                .filter(\.$entity.$id ~~ entityIDs)
+                .sort(\.$sortOrder, .ascending)
+                .all()
+            for pin in pins {
+                pinsByEntity[pin.$entity.id, default: []].append(pin.$action.id)
+            }
+        }
+
         return entities.compactMap { e in
             guard let id = e.id else { return nil }
             return EntityResponse(
@@ -706,6 +719,7 @@ func routes(_ app: Application) throws {
                 metadata: e.metadata,
                 birthday: e.birthday,
                 imageURL: e.imageURL,
+                pinnedActionIDs: pinsByEntity[id] ?? [],
                 createdAt: e.createdAt,
                 updatedAt: e.updatedAt
             )
