@@ -9,6 +9,12 @@ private struct BooleanEventRequest: Content {
     let note: String
 }
 
+private struct RoutineRequest: Content {
+    let entityID: UUID
+    let name: String
+    let items: [RoutineItem]
+}
+
 @Suite("API boundaries", .serialized)
 struct NesticServerTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -82,6 +88,16 @@ struct NesticServerTests {
         #expect(throws: (any Error).self) { try InputValidation.event(type: .text, number: nil, text: " ", boolean: nil, json: nil, note: nil) }
     }
 
+    @Test("Routine items encode as one JSON document")
+    func routineItemsUseJSONDocument() throws {
+        let items = [RoutineItem(trackerID: UUID(), valueNumber: 1.5, valueText: nil,
+                                 valueBool: nil, valueJSON: nil)]
+        let encoded = try JSONEncoder().encode(RoutineItems(items))
+        let json = try JSONSerialization.jsonObject(with: encoded)
+        #expect(json is [Any])
+        #expect(try JSONDecoder().decode(RoutineItems.self, from: encoded).values == items)
+    }
+
     @Test("Public profile never serializes a password hash")
     func publicProfile() throws {
         let user = User(email: "person@example.com", passwordHash: "private-hash", displayName: "Alex")
@@ -138,6 +154,19 @@ struct PostgresIntegrationTests {
             })
             #expect(editedAction.status == .ok)
             #expect(try editedAction.content.decode(TrackableActionResponse.self).name == "Bathroom break")
+            let pinned = try await api.sendRequest(.PUT, "entities/\(entity.id)/pinned-actions", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(SetPinnedActionsRequest(actionIds: [action.id]))
+            })
+            #expect(pinned.status == .noContent)
+            let routine = try await api.sendRequest(.POST, "nests/\(nest.id)/routines", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(RoutineRequest(
+                    entityID: entity.id,
+                    name: "Morning care",
+                    items: [RoutineItem(trackerID: action.id, valueNumber: nil, valueText: nil, valueBool: false, valueJSON: nil)]
+                ))
+            })
+            #expect(routine.status == .ok)
+            #expect(try routine.content.decode(RoutineResponse.self).items.count == 1)
             let added = try await api.sendRequest(.POST, "nests/\(nest.id)/members", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["email": "member-\(suffix)@example.com", "role": "viewer"])
             })

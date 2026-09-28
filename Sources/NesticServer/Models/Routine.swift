@@ -9,6 +9,27 @@ struct RoutineItem: Codable, Content, Hashable, Sendable {
     let valueJSON: [String: String]?
 }
 
+/// Postgres must receive the routine item list as one JSON document, not as a
+/// native array of JSON values (jsonb[]). The wrapper preserves the API's
+/// array representation while making Fluent bind the field as a single jsonb.
+struct RoutineItems: Codable, Hashable, Sendable {
+    var values: [RoutineItem]
+
+    init(_ values: [RoutineItem] = []) {
+        self.values = values
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        values = try container.decode([RoutineItem].self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(values)
+    }
+}
+
 final class Routine: Model, Content, @unchecked Sendable {
     static let schema = "routines"
 
@@ -25,7 +46,7 @@ final class Routine: Model, Content, @unchecked Sendable {
     var name: String
 
     @Field(key: "items")
-    var items: [RoutineItem]
+    var items: RoutineItems
 
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
@@ -40,6 +61,6 @@ final class Routine: Model, Content, @unchecked Sendable {
         self.$nest.id = nestID
         self.$entity.id = entityID
         self.name = name
-        self.items = items
+        self.items = RoutineItems(items)
     }
 }

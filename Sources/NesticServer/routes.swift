@@ -258,7 +258,7 @@ struct RoutineDeletedResponse: Content {
 
 private func routineResponse(_ routine: Routine) throws -> RoutineResponse {
     RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id, entityId: routine.$entity.id,
-                    name: routine.name, items: routine.items, createdAt: routine.createdAt,
+                    name: routine.name, items: routine.items.values, createdAt: routine.createdAt,
                     updatedAt: routine.updatedAt)
 }
 
@@ -1160,8 +1160,10 @@ func routes(_ app: Application) throws {
                 .filter(\.$nest.$id == nestID)
                 .all()
             for routine in routines {
-                routine.items.removeAll { $0.trackerID == actionID }
-                if routine.items.isEmpty { try await routine.delete(on: tx) }
+                var itemContainer = routine.items
+                itemContainer.values.removeAll { $0.trackerID == actionID }
+                routine.items = itemContainer
+                if routine.items.values.isEmpty { try await routine.delete(on: tx) }
                 else { try await routine.save(on: tx) }
             }
             try await action.delete(on: tx)
@@ -1411,15 +1413,15 @@ func routes(_ app: Application) throws {
         guard occurredAt.timeIntervalSinceNow <= 300 else {
             throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
         }
-        try await validateRoutineItems(routine.items, entityID: routine.$entity.id, nestID: nestID, on: req.db)
+        try await validateRoutineItems(routine.items.values, entityID: routine.$entity.id, nestID: nestID, on: req.db)
 
         let actions = try await TrackableAction.query(on: req.db)
-            .filter(\.$id ~~ routine.items.map(\.trackerID))
+            .filter(\.$id ~~ routine.items.values.map(\.trackerID))
             .all()
         let cleanNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let events: [ActionEvent] = try await req.db.transaction { tx async throws -> [ActionEvent] in
             var created: [ActionEvent] = []
-            for item in routine.items {
+            for item in routine.items.values {
                 guard let action = actions.first(where: { $0.id == item.trackerID }) else {
                     throw Abort(.badRequest, reason: "A routine tracker is no longer available.")
                 }
