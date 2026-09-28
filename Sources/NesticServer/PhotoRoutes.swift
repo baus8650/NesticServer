@@ -57,6 +57,7 @@ private func entityResponse(for entity: Entity) throws -> EntityResponse {
         metadata: entity.metadata,
         birthday: entity.birthday,
         imageURL: entity.imageURL,
+        pinnedActionIDs: [],
         createdAt: entity.createdAt,
         updatedAt: entity.updatedAt
     )

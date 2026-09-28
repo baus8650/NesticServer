@@ -126,7 +126,7 @@ struct EntityResponse: Content {
     let metadata: [String: String]?
     let birthday: Date?
     let imageURL: String?
-    let pinnedActionIDs: [UUID] = []
+    let pinnedActionIDs: [UUID]
     let createdAt: Date?
     let updatedAt: Date?
 }
@@ -886,6 +886,7 @@ func routes(_ app: Application) throws {
             metadata: entity.metadata,
             birthday: entity.birthday,
             imageURL: entity.imageURL,
+            pinnedActionIDs: [],
             createdAt: entity.createdAt,
             updatedAt: entity.updatedAt
         )
@@ -950,6 +951,7 @@ func routes(_ app: Application) throws {
             metadata: entity.metadata,
             birthday: entity.birthday,
             imageURL: entity.imageURL,
+            pinnedActionIDs: [],
             createdAt: entity.createdAt,
             updatedAt: entity.updatedAt
         )
