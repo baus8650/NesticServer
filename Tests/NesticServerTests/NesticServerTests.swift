@@ -99,6 +99,15 @@ struct NesticServerTests {
 
         let legacyArray = try JSONEncoder().encode(items)
         #expect(try JSONDecoder().decode(RoutineItems.self, from: legacyArray).values == items)
+
+        let namedDocument = try JSONEncoder().encode(["items": items])
+        #expect(try JSONDecoder().decode(RoutineItems.self, from: namedDocument).values == items)
+
+        let singleItemDocument = try JSONEncoder().encode(["values": items[0]])
+        #expect(try JSONDecoder().decode(RoutineItems.self, from: singleItemDocument).values == items)
+
+        let singleItem = try JSONEncoder().encode(items[0])
+        #expect(try JSONDecoder().decode(RoutineItems.self, from: singleItem).values == items)
     }
 
     @Test("Routine targets preserve multiple entities in one JSON document")
@@ -116,6 +125,15 @@ struct NesticServerTests {
 
         let legacyArray = try JSONEncoder().encode([first, second])
         #expect(try JSONDecoder().decode(RoutineTargets.self, from: legacyArray).values == [first, second])
+
+        let namedDocument = try JSONEncoder().encode(["targets": [first, second]])
+        #expect(try JSONDecoder().decode(RoutineTargets.self, from: namedDocument).values == [first, second])
+
+        let singleTargetDocument = try JSONEncoder().encode(["values": first])
+        #expect(try JSONDecoder().decode(RoutineTargets.self, from: singleTargetDocument).values == [first])
+
+        let singleTarget = try JSONEncoder().encode(first)
+        #expect(try JSONDecoder().decode(RoutineTargets.self, from: singleTarget).values == [first])
     }
 
     @Test("Public profile never serializes a password hash")

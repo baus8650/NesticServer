@@ -21,6 +21,36 @@ struct RoutineTarget: Codable, Content, Hashable, Sendable {
 struct RoutineItems: Codable, Hashable, Sendable {
     var values: [RoutineItem]
 
+    private enum Collection: Decodable {
+        case array([RoutineItem])
+        case item(RoutineItem)
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let array = try? container.decode([RoutineItem].self) {
+                self = .array(array)
+            } else {
+                self = .item(try container.decode(RoutineItem.self))
+            }
+        }
+    }
+
+    private struct Document: Decodable {
+        let values: Collection?
+        let items: Collection?
+
+        private enum CodingKeys: String, CodingKey {
+            case values
+            case items
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            values = try container.decodeIfPresent(Collection.self, forKey: .values)
+            items = try container.decodeIfPresent(Collection.self, forKey: .items)
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case values
     }
@@ -30,13 +60,39 @@ struct RoutineItems: Codable, Hashable, Sendable {
     }
 
     init(from decoder: any Decoder) throws {
-        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
-            values = try container.decode([RoutineItem].self, forKey: .values)
-        } else {
-            // Rows written by the earlier array-shaped representation remain
-            // readable while new writes use the object-shaped JSON document.
-            values = try decoder.singleValueContainer().decode([RoutineItem].self)
+        let container = try decoder.singleValueContainer()
+
+        // Rows written by the original representation are top-level arrays.
+        if let array = try? container.decode([RoutineItem].self) {
+            values = array
+            return
         }
+
+        // Current rows are JSON documents. Accept both field names used by
+        // the migration history so a malformed/older row cannot break the
+        // entire routines response.
+        if let document = try? container.decode(Document.self),
+           let documentValues = document.values ?? document.items {
+            switch documentValues {
+            case .array(let array): values = array
+            case .item(let item): values = [item]
+            }
+            return
+        }
+
+        // Be tolerant of a row that contains one item instead of an array.
+        if let item = try? container.decode(RoutineItem.self) {
+            values = [item]
+            return
+        }
+
+        throw DecodingError.typeMismatch(
+            [RoutineItem].self,
+            DecodingError.Context(
+                codingPath: decoder.codingPath,
+                debugDescription: "Expected routine items as an array or JSON document"
+            )
+        )
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -48,6 +104,36 @@ struct RoutineItems: Codable, Hashable, Sendable {
 struct RoutineTargets: Codable, Hashable, Sendable {
     var values: [RoutineTarget]
 
+    private enum Collection: Decodable {
+        case array([RoutineTarget])
+        case target(RoutineTarget)
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let array = try? container.decode([RoutineTarget].self) {
+                self = .array(array)
+            } else {
+                self = .target(try container.decode(RoutineTarget.self))
+            }
+        }
+    }
+
+    private struct Document: Decodable {
+        let values: Collection?
+        let targets: Collection?
+
+        private enum CodingKeys: String, CodingKey {
+            case values
+            case targets
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            values = try container.decodeIfPresent(Collection.self, forKey: .values)
+            targets = try container.decodeIfPresent(Collection.self, forKey: .targets)
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case values
     }
@@ -57,11 +143,34 @@ struct RoutineTargets: Codable, Hashable, Sendable {
     }
 
     init(from decoder: any Decoder) throws {
-        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
-            values = try container.decode([RoutineTarget].self, forKey: .values)
-        } else {
-            values = try decoder.singleValueContainer().decode([RoutineTarget].self)
+        let container = try decoder.singleValueContainer()
+
+        if let array = try? container.decode([RoutineTarget].self) {
+            values = array
+            return
         }
+
+        if let document = try? container.decode(Document.self),
+           let documentValues = document.values ?? document.targets {
+            switch documentValues {
+            case .array(let array): values = array
+            case .target(let target): values = [target]
+            }
+            return
+        }
+
+        if let target = try? container.decode(RoutineTarget.self) {
+            values = [target]
+            return
+        }
+
+        throw DecodingError.typeMismatch(
+            [RoutineTarget].self,
+            DecodingError.Context(
+                codingPath: decoder.codingPath,
+                debugDescription: "Expected routine targets as an array or JSON document"
+            )
+        )
     }
 
     func encode(to encoder: any Encoder) throws {
