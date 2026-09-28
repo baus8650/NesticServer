@@ -94,8 +94,11 @@ struct NesticServerTests {
                                  valueBool: nil, valueJSON: nil)]
         let encoded = try JSONEncoder().encode(RoutineItems(items))
         let json = try JSONSerialization.jsonObject(with: encoded)
-        #expect(json is [Any])
+        #expect(json as? [String: Any] != nil)
         #expect(try JSONDecoder().decode(RoutineItems.self, from: encoded).values == items)
+
+        let legacyArray = try JSONEncoder().encode(items)
+        #expect(try JSONDecoder().decode(RoutineItems.self, from: legacyArray).values == items)
     }
 
     @Test("Routine targets preserve multiple entities in one JSON document")
@@ -108,8 +111,11 @@ struct NesticServerTests {
         ])
         let encoded = try JSONEncoder().encode(RoutineTargets([first, second]))
         let json = try JSONSerialization.jsonObject(with: encoded)
-        #expect(json is [Any])
+        #expect(json as? [String: Any] != nil)
         #expect(try JSONDecoder().decode(RoutineTargets.self, from: encoded).values == [first, second])
+
+        let legacyArray = try JSONEncoder().encode([first, second])
+        #expect(try JSONDecoder().decode(RoutineTargets.self, from: legacyArray).values == [first, second])
     }
 
     @Test("Public profile never serializes a password hash")

@@ -15,41 +15,58 @@ struct RoutineTarget: Codable, Content, Hashable, Sendable {
 }
 
 /// Postgres must receive the routine item list as one JSON document, not as a
-/// native array of JSON values (jsonb[]). The wrapper preserves the API's
-/// array representation while making Fluent bind the field as a single jsonb.
+/// native array of JSON values (jsonb[]). Encoding the wrapper as an object is
+/// important here: PostgresKit otherwise sees a top-level Swift array and
+/// binds it as a PostgreSQL jsonb[] value instead of a single jsonb document.
 struct RoutineItems: Codable, Hashable, Sendable {
     var values: [RoutineItem]
+
+    private enum CodingKeys: String, CodingKey {
+        case values
+    }
 
     init(_ values: [RoutineItem] = []) {
         self.values = values
     }
 
     init(from decoder: any Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        values = try container.decode([RoutineItem].self)
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            values = try container.decode([RoutineItem].self, forKey: .values)
+        } else {
+            // Rows written by the earlier array-shaped representation remain
+            // readable while new writes use the object-shaped JSON document.
+            values = try decoder.singleValueContainer().decode([RoutineItem].self)
+        }
     }
 
     func encode(to encoder: any Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(values)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(values, forKey: .values)
     }
 }
 
 struct RoutineTargets: Codable, Hashable, Sendable {
     var values: [RoutineTarget]
 
+    private enum CodingKeys: String, CodingKey {
+        case values
+    }
+
     init(_ values: [RoutineTarget] = []) {
         self.values = values
     }
 
     init(from decoder: any Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        values = try container.decode([RoutineTarget].self)
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            values = try container.decode([RoutineTarget].self, forKey: .values)
+        } else {
+            values = try decoder.singleValueContainer().decode([RoutineTarget].self)
+        }
     }
 
     func encode(to encoder: any Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(values)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(values, forKey: .values)
     }
 }
 
