@@ -141,6 +141,9 @@ struct TrackableActionResponse: Content {
     let color: String?
     let groupName: String?
     let description: String?
+    let goalDescription: String?
+    let goalTarget: Double?
+    let goalDate: Date?
     let createdAt: Date?
     let updatedAt: Date?
 }
@@ -157,6 +160,8 @@ struct ActionEventResponse: Content {
     let valueBool: Bool?
     let valueJSON: [String: String]?
     let note: String?
+    let wasAccident: Bool
+    let includeInPredictions: Bool
 }
 
 struct UpdateEventRequest: Content {
@@ -166,6 +171,8 @@ struct UpdateEventRequest: Content {
     let valueBool: Bool?
     let valueJSON: [String: String]?
     let note: String?
+    let wasAccident: Bool?
+    let includeInPredictions: Bool?
 }
 
 struct MemberResponse: Content {
@@ -1064,6 +1071,9 @@ func routes(_ app: Application) throws {
                 color: a.color,
                 groupName: a.groupName,
                 description: a.description,
+                goalDescription: a.goalDescription,
+                goalTarget: a.goalTarget,
+                goalDate: a.goalDate,
                 createdAt: a.createdAt,
                 updatedAt: a.updatedAt
             )
@@ -1100,6 +1110,9 @@ func routes(_ app: Application) throws {
             let color: String?
             let groupName: String?
             let description: String?
+            let goalDescription: String?
+            let goalTarget: Double?
+            let goalDate: Date?
         }
 
         let input = try req.content.decode(CreateActionRequest.self)
@@ -1108,6 +1121,10 @@ func routes(_ app: Application) throws {
         let groupName = input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines)
             : nil
+        let goalDescription = input.goalDescription?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? input.goalDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+        let goalTarget = input.goalTarget?.isFinite == true ? input.goalTarget : nil
 
         let action = TrackableAction(
             nestID: nestID,
@@ -1117,7 +1134,10 @@ func routes(_ app: Application) throws {
             symbol: symbol,
             color: color,
             groupName: groupName,
-            description: input.description
+            description: input.description,
+            goalDescription: goalDescription,
+            goalTarget: goalTarget,
+            goalDate: input.goalDate
         )
 
         do { try await action.save(on: req.db) }
@@ -1134,6 +1154,9 @@ func routes(_ app: Application) throws {
             color: action.color,
             groupName: action.groupName,
             description: action.description,
+            goalDescription: action.goalDescription,
+            goalTarget: action.goalTarget,
+            goalDate: action.goalDate,
             createdAt: action.createdAt,
             updatedAt: action.updatedAt
         )
@@ -1173,6 +1196,9 @@ func routes(_ app: Application) throws {
             let color: String?
             let groupName: String?
             let description: String?
+            let goalDescription: String?
+            let goalTarget: Double?
+            let goalDate: Date?
         }
         let input = try req.content.decode(UpdateActionRequest.self)
         if let name = input.name { action.name = try InputValidation.name(name) }
@@ -1184,6 +1210,11 @@ func routes(_ app: Application) throws {
         let trimmedGroupName = input.groupName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         action.groupName = trimmedGroupName.isEmpty ? nil : trimmedGroupName
         if let description = input.description { action.description = description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : description }
+        action.goalDescription = input.goalDescription?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? input.goalDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+        action.goalTarget = input.goalTarget?.isFinite == true ? input.goalTarget : nil
+        action.goalDate = input.goalDate
         try await action.save(on: req.db)
 
         let response = TrackableActionResponse(id: try action.requireID(), nestId: nestID, name: action.name,
@@ -1191,7 +1222,11 @@ func routes(_ app: Application) throws {
                                                symbol: action.symbol,
                                                color: action.color,
                                                groupName: action.groupName,
-                                               description: action.description, createdAt: action.createdAt,
+                                               description: action.description,
+                                               goalDescription: action.goalDescription,
+                                               goalTarget: action.goalTarget,
+                                               goalDate: action.goalDate,
+                                               createdAt: action.createdAt,
                                                updatedAt: action.updatedAt)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)
         return response
@@ -1569,6 +1604,8 @@ func routes(_ app: Application) throws {
             let valueJSON: [String: String]?
 
             let note: String?
+            let wasAccident: Bool?
+            let includeInPredictions: Bool?
         }
 
         let input = try req.content.decode(CreateEventRequest.self)
@@ -1595,7 +1632,9 @@ func routes(_ app: Application) throws {
             valueText: input.valueText,
             valueBool: input.valueBool,
             valueJSON: input.valueJSON,
-            note: input.note
+            note: input.note,
+            wasAccident: input.wasAccident ?? false,
+            includeInPredictions: input.includeInPredictions ?? true
         )
 
         try await event.save(on: req.db)
@@ -1611,7 +1650,9 @@ func routes(_ app: Application) throws {
             valueText: event.valueText,
             valueBool: event.valueBool,
             valueJSON: event.valueJSON,
-            note: event.note
+            note: event.note,
+            wasAccident: event.wasAccident,
+            includeInPredictions: event.includeInPredictions
         )
 
         // Realtime broadcast to all members connected to this nest
@@ -1666,7 +1707,9 @@ func routes(_ app: Application) throws {
                 valueText: e.valueText,
                 valueBool: e.valueBool,
                 valueJSON: e.valueJSON,
-                note: e.note
+                note: e.note,
+                wasAccident: e.wasAccident,
+                includeInPredictions: e.includeInPredictions
             )
         }
     }
@@ -1721,6 +1764,12 @@ func routes(_ app: Application) throws {
         event.valueText = input.valueText?.trimmingCharacters(in: .whitespacesAndNewlines)
         event.valueBool = input.valueBool
         event.valueJSON = input.valueJSON
+        if let wasAccident = input.wasAccident {
+            event.wasAccident = wasAccident
+        }
+        if let includeInPredictions = input.includeInPredictions {
+            event.includeInPredictions = includeInPredictions
+        }
         let cleanedNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
         event.note = cleanedNote?.isEmpty == true ? nil : cleanedNote
         try await event.save(on: req.db)
@@ -1764,6 +1813,7 @@ extension ActionEvent {
         ActionEventResponse(id: try requireID(), nestId: $nest.id, entityId: $entity.id,
             actionId: $action.id, actorUserId: $actor.id, occurredAt: occurredAt,
             valueNumber: valueNumber, valueText: valueText, valueBool: valueBool,
-            valueJSON: valueJSON, note: note)
+            valueJSON: valueJSON, note: note,
+            wasAccident: wasAccident, includeInPredictions: includeInPredictions)
     }
 }

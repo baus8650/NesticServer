@@ -47,6 +47,12 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
     @OptionalField(key: "note")
     var note: String?
 
+    @Field(key: "was_accident")
+    var wasAccident: Bool
+
+    @Field(key: "include_in_predictions")
+    var includeInPredictions: Bool
+
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
 
@@ -63,7 +69,9 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         valueText: String? = nil,
         valueBool: Bool? = nil,
         valueJSON: [String: String]? = nil,
-        note: String? = nil
+        note: String? = nil,
+        wasAccident: Bool = false,
+        includeInPredictions: Bool = true
     ) {
         self.id = id
         self.$nest.id = nestID
@@ -76,5 +84,7 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         self.valueBool = valueBool
         self.valueJSON = valueJSON
         self.note = note
+        self.wasAccident = wasAccident
+        self.includeInPredictions = includeInPredictions
     }
 }

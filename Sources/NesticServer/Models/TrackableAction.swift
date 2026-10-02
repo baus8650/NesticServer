@@ -46,6 +46,15 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
     @OptionalField(key: "description")
     var description: String?
 
+    @OptionalField(key: "goal_description")
+    var goalDescription: String?
+
+    @OptionalField(key: "goal_target")
+    var goalTarget: Double?
+
+    @OptionalField(key: "goal_date")
+    var goalDate: Date?
+
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
 
@@ -54,7 +63,7 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
 
     init() {}
 
-    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, symbol: String? = nil, color: String? = nil, groupName: String? = nil, description: String? = nil) {
+    init(id: UUID? = nil, nestID: UUID, name: String, valueType: ActionValueType, unit: String? = nil, symbol: String? = nil, color: String? = nil, groupName: String? = nil, description: String? = nil, goalDescription: String? = nil, goalTarget: Double? = nil, goalDate: Date? = nil) {
         self.id = id
         self.$nest.id = nestID
         self.name = name
@@ -64,5 +73,8 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
         self.color = color
         self.groupName = groupName
         self.description = description
+        self.goalDescription = goalDescription
+        self.goalTarget = goalTarget
+        self.goalDate = goalDate
     }
 }

@@ -120,12 +120,17 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `PATCH /actions/:id`, `DELETE /actions/:id` | Edit tracker metadata or remove a tracker, its quick-action pins, and its history |
 | `GET /entities/:id/pinned-actions`, `PUT /entities/:id/pinned-actions` | Read; replace pins with `{actionIds:[UUID]}` |
 | `GET /nests/:id/entities/summary` | Subjects, ordered pinned actions, and latest value for each |
-| `POST /entities/:id/events` | Log `{actionID,occurredAt?,valueNumber?,valueText?,valueBool?,valueJSON?,note?}` |
+| `POST /nests/:id/actions` | Create a tracker with optional `{name,valueType,unit,symbol,color,groupName,description,goalDescription,goalTarget,goalDate}` |
+| `POST /entities/:id/events` | Log `{actionID,occurredAt?,valueNumber?,valueText?,valueBool?,valueJSON?,note?,wasAccident?,includeInPredictions?}` |
 | `GET /nests/:id/events?limit=200&before=<ISO date>` | Shared feed page, newest first; use `before` for older updates |
 | `GET /entities/:id/events?limit=200&before=<ISO date>` | Subject feed page, newest first; use `before` for older updates |
 | `DELETE /events/:id` | Logger or administrator deletes activity |
 
 `kind` is `person`, `pet`, `thing`, or `custom`. `valueType` is `none`, `number`, `text`, `boolean`, or `json`. Only supply the matching value field, or none for a simple occurrence. `valueJSON` is a string-to-string dictionary. Activity cannot be dated more than five minutes ahead of the server. Names are trimmed and limited to 100 characters; notes/text to 2,000.
+
+Every event also carries `wasAccident` and `includeInPredictions` metadata. Both are optional when creating an event; they default to `false` and `true`, respectively. Updates may omit either field to preserve its existing value.
+
+Trackers in the `Training` group can carry an optional `goalDescription`, numeric `goalTarget`, and `goalDate`. These describe the training program while the tracker’s ordinary events provide its progress history.
 
 Owners/admins define trackers and add members. Only owners can grant administrator/owner roles. Members can add and edit subjects, pin actions, and log activity. Viewers can read but cannot mutate nest content.
 
