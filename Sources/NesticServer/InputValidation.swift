@@ -57,6 +57,7 @@ enum InputValidation {
         case .text: matches = supplied == 1 && text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         case .boolean: matches = supplied == 1 && boolean != nil
         case .json: matches = supplied == 1 && json?.isEmpty == false
+        case .photo: matches = supplied == 0
         }
         guard matches else { throw Abort(.badRequest, reason: "This tracker requires a \(type.rawValue) value.") }
         guard (text?.count ?? 0) <= 2000, (note?.count ?? 0) <= 2000,

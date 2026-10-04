@@ -25,8 +25,8 @@ struct R2StorageConfiguration: Sendable {
     }
 }
 
-/// Private object storage for subject avatars. The R2 bucket is never public;
-/// the API proxies reads after checking nest membership.
+/// Private object storage for subject avatars and event photos. The R2 bucket
+/// is never public; the API proxies reads after checking nest membership.
 final class R2Storage: @unchecked Sendable {
     private let client: AWSClient
     private let s3: S3
@@ -73,6 +73,10 @@ final class R2Storage: @unchecked Sendable {
 
     static func key(for entityID: UUID) -> String {
         "subjects/\(entityID.uuidString.lowercased())/avatar.jpg"
+    }
+
+    static func key(forEventID eventID: UUID) -> String {
+        "events/\(eventID.uuidString.lowercased())/photo.jpg"
     }
 
     static func reference(for key: String) -> String {

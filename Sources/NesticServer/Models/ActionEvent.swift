@@ -47,6 +47,12 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
     @OptionalField(key: "note")
     var note: String?
 
+    /// Private R2 reference for a photo attached to this event. The API
+    /// proxies the binary after checking nest membership; the reference is
+    /// never exposed as a public URL.
+    @OptionalField(key: "photo_url")
+    var photoURL: String?
+
     @Field(key: "was_accident")
     var wasAccident: Bool
 
@@ -70,6 +76,7 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         valueBool: Bool? = nil,
         valueJSON: [String: String]? = nil,
         note: String? = nil,
+        photoURL: String? = nil,
         wasAccident: Bool = false,
         includeInPredictions: Bool = true
     ) {
@@ -84,6 +91,7 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         self.valueBool = valueBool
         self.valueJSON = valueJSON
         self.note = note
+        self.photoURL = photoURL
         self.wasAccident = wasAccident
         self.includeInPredictions = includeInPredictions
     }

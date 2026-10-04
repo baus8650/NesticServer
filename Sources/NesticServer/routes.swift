@@ -157,6 +157,7 @@ struct ActionEventResponse: Content {
     let valueBool: Bool?
     let valueJSON: [String: String]?
     let note: String?
+    let photoURL: String?
     let wasAccident: Bool
     let includeInPredictions: Bool
 }
@@ -995,6 +996,11 @@ func routes(_ app: Application) throws {
             nestId: nestID
         )
 
+        let eventPhotoKeys = try await ActionEvent.query(on: req.db)
+            .filter(\.$entity.$id == entityID)
+            .all()
+            .compactMap { R2Storage.key(from: $0.photoURL) }
+
         // Cascade-delete related rows
         try await req.db.transaction { tx in
             try await EntityPinnedAction.query(on: tx)
@@ -1026,6 +1032,11 @@ func routes(_ app: Application) throws {
         if let key = R2Storage.key(from: entity.imageURL),
            let storage = req.application.r2Storage {
             try? await storage.delete(key: key, logger: req.logger)
+        }
+        if let storage = req.application.r2Storage {
+            for key in eventPhotoKeys {
+                try? await storage.delete(key: key, logger: req.logger)
+            }
         }
 
         req.application.realtimeHub.broadcast(
@@ -1220,6 +1231,10 @@ func routes(_ app: Application) throws {
         guard canManage else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         let deleted = ActionDeletedResponse(id: actionID, nestId: nestID)
+        let eventPhotoKeys = try await ActionEvent.query(on: req.db)
+            .filter(\.$action.$id == actionID)
+            .all()
+            .compactMap { R2Storage.key(from: $0.photoURL) }
         try await req.db.transaction { tx in
             try await EntityPinnedAction.query(on: tx).filter(\.$action.$id == actionID).delete()
             try await ActionEvent.query(on: tx).filter(\.$action.$id == actionID).delete()
@@ -1244,6 +1259,11 @@ func routes(_ app: Application) throws {
                 }
             }
             try await action.delete(on: tx)
+        }
+        if let storage = req.application.r2Storage {
+            for key in eventPhotoKeys {
+                try? await storage.delete(key: key, logger: req.logger)
+            }
         }
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.deleted", data: deleted)
         return .noContent
@@ -1620,6 +1640,7 @@ func routes(_ app: Application) throws {
             valueBool: event.valueBool,
             valueJSON: event.valueJSON,
             note: event.note,
+            photoURL: event.photoURL,
             wasAccident: event.wasAccident,
             includeInPredictions: event.includeInPredictions
         )
@@ -1677,6 +1698,7 @@ func routes(_ app: Application) throws {
                 valueBool: e.valueBool,
                 valueJSON: e.valueJSON,
                 note: e.note,
+                photoURL: e.photoURL,
                 wasAccident: e.wasAccident,
                 includeInPredictions: e.includeInPredictions
             )
@@ -1761,7 +1783,11 @@ func routes(_ app: Application) throws {
               event.$actor.id == session.userId || membership.role == .admin || membership.role == .owner else {
             throw Abort(.forbidden, reason: "Only the person who logged this activity or a nest administrator can delete it")
         }
+        let photoKey = R2Storage.key(from: event.photoURL)
         try await event.delete(on: req.db)
+        if let photoKey, let storage = req.application.r2Storage {
+            try? await storage.delete(key: photoKey, logger: req.logger)
+        }
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.deleted",
             data: EventDeletedResponse(id: eventID, nestId: nestID, entityId: event.$entity.id))
         return .noContent
@@ -1782,7 +1808,7 @@ extension ActionEvent {
         ActionEventResponse(id: try requireID(), nestId: $nest.id, entityId: $entity.id,
             actionId: $action.id, actorUserId: $actor.id, occurredAt: occurredAt,
             valueNumber: valueNumber, valueText: valueText, valueBool: valueBool,
-            valueJSON: valueJSON, note: note,
+            valueJSON: valueJSON, note: note, photoURL: photoURL,
             wasAccident: wasAccident, includeInPredictions: includeInPredictions)
     }
 }
