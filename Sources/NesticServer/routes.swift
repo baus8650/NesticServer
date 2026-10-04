@@ -158,8 +158,17 @@ struct ActionEventResponse: Content {
     let valueJSON: [String: String]?
     let note: String?
     let photoURL: String?
+    let photoUpdates: [ActionEventPhotoResponse]
+    let resolvedAt: Date?
+    let resolutionNote: String?
     let wasAccident: Bool
     let includeInPredictions: Bool
+}
+
+struct ActionEventPhotoResponse: Content {
+    let id: UUID
+    let capturedAt: Date
+    let photoURL: String
 }
 
 struct UpdateEventRequest: Content {
@@ -171,6 +180,11 @@ struct UpdateEventRequest: Content {
     let note: String?
     let wasAccident: Bool?
     let includeInPredictions: Bool?
+}
+
+struct ResolveEventRequest: Content {
+    let resolvedAt: Date?
+    let note: String?
 }
 
 struct MemberResponse: Content {
@@ -1641,6 +1655,9 @@ func routes(_ app: Application) throws {
             valueJSON: event.valueJSON,
             note: event.note,
             photoURL: event.photoURL,
+            photoUpdates: [],
+            resolvedAt: event.resolvedAt,
+            resolutionNote: event.resolutionNote,
             wasAccident: event.wasAccident,
             includeInPredictions: event.includeInPredictions
         )
@@ -1678,13 +1695,14 @@ func routes(_ app: Application) throws {
         let limit = min(200, max(1, (try? req.query.get(Int.self, at: "limit")) ?? 100))
         var query = ActionEvent.query(on: req.db)
             .filter(\.$entity.$id == entityID)
+            .with(\.$photoUpdates)
             .sort(\.$occurredAt, .descending)
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
         }
         let events = try await query.range(..<limit).all()
 
-        return events.compactMap { e in
+        return try events.compactMap { e in
             guard let id = e.id else { return nil }
             return ActionEventResponse(
                 id: id,
@@ -1699,6 +1717,9 @@ func routes(_ app: Application) throws {
                 valueJSON: e.valueJSON,
                 note: e.note,
                 photoURL: e.photoURL,
+                photoUpdates: try e.photoUpdates.map { try $0.response() },
+                resolvedAt: e.resolvedAt,
+                resolutionNote: e.resolutionNote,
                 wasAccident: e.wasAccident,
                 includeInPredictions: e.includeInPredictions
             )
@@ -1715,6 +1736,7 @@ func routes(_ app: Application) throws {
         let limit = min(200, max(1, (try? req.query.get(Int.self, at: "limit")) ?? 100))
         var query = ActionEvent.query(on: req.db)
             .filter(\.$nest.$id == nestID)
+            .with(\.$photoUpdates)
             .sort(\.$occurredAt, .descending)
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
@@ -1749,6 +1771,9 @@ func routes(_ app: Application) throws {
         guard input.occurredAt.timeIntervalSinceNow <= 300 else {
             throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
         }
+        if let resolvedAt = event.resolvedAt, resolvedAt < input.occurredAt {
+            throw Abort(.badRequest, reason: "Onset cannot be later than the recorded resolution")
+        }
 
         event.occurredAt = input.occurredAt
         event.valueNumber = input.valueNumber
@@ -1765,7 +1790,70 @@ func routes(_ app: Application) throws {
         event.note = cleanedNote?.isEmpty == true ? nil : cleanedNote
         try await event.save(on: req.db)
 
-        let response = try event.response()
+        let response = try await event.response(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
+    }
+
+    protected.post("events", ":eventID", "resolve") { req async throws -> ActionEventResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let eventID = try req.parameters.require("eventID", as: UUID.self)
+        guard let event = try await ActionEvent.find(eventID, on: req.db) else {
+            throw Abort(.notFound, reason: "Activity not found")
+        }
+        let nestID = event.$nest.id
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first(), membership.role != .viewer,
+            event.$actor.id == session.userId || membership.role == .admin || membership.role == .owner else {
+            throw Abort(.forbidden, reason: "Only the person who logged this activity or a nest administrator can resolve it")
+        }
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events can be resolved")
+        }
+
+        let input = try req.content.decode(ResolveEventRequest.self)
+        let resolvedAt = input.resolvedAt ?? Date()
+        guard resolvedAt >= event.occurredAt else {
+            throw Abort(.badRequest, reason: "Resolution cannot happen before onset")
+        }
+        guard resolvedAt.timeIntervalSinceNow <= 300 else {
+            throw Abort(.badRequest, reason: "Resolution cannot be in the future")
+        }
+        guard (input.note?.count ?? 0) <= 2000 else {
+            throw Abort(.badRequest, reason: "Resolution notes are limited to 2,000 characters")
+        }
+        event.resolvedAt = resolvedAt
+        let cleanNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        event.resolutionNote = cleanNote?.isEmpty == true ? nil : cleanNote
+        try await event.save(on: req.db)
+        let response = try await event.response(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
+    }
+
+    protected.delete("events", ":eventID", "resolve") { req async throws -> ActionEventResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let eventID = try req.parameters.require("eventID", as: UUID.self)
+        guard let event = try await ActionEvent.find(eventID, on: req.db) else {
+            throw Abort(.notFound, reason: "Activity not found")
+        }
+        let nestID = event.$nest.id
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first(), membership.role != .viewer,
+            event.$actor.id == session.userId || membership.role == .admin || membership.role == .owner else {
+            throw Abort(.forbidden, reason: "Only the person who logged this activity or a nest administrator can reopen it")
+        }
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events can be reopened")
+        }
+        event.resolvedAt = nil
+        event.resolutionNote = nil
+        try await event.save(on: req.db)
+        let response = try await event.response(on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
         return response
     }
@@ -1784,9 +1872,17 @@ func routes(_ app: Application) throws {
             throw Abort(.forbidden, reason: "Only the person who logged this activity or a nest administrator can delete it")
         }
         let photoKey = R2Storage.key(from: event.photoURL)
+        let photoUpdates = try await event.$photoUpdates.get(on: req.db)
         try await event.delete(on: req.db)
         if let photoKey, let storage = req.application.r2Storage {
             try? await storage.delete(key: photoKey, logger: req.logger)
+        }
+        if let storage = req.application.r2Storage {
+            for photo in photoUpdates {
+                if let key = R2Storage.key(from: photo.photoURL) {
+                    try? await storage.delete(key: key, logger: req.logger)
+                }
+            }
         }
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.deleted",
             data: EventDeletedResponse(id: eventID, nestId: nestID, entityId: event.$entity.id))
@@ -1804,11 +1900,24 @@ struct EventDeletedResponse: Content {
 }
 
 extension ActionEvent {
-    func response() throws -> ActionEventResponse {
-        ActionEventResponse(id: try requireID(), nestId: $nest.id, entityId: $entity.id,
+    func response(photos: [ActionEventPhoto]? = nil) throws -> ActionEventResponse {
+        let resolvedPhotos = photos ?? photoUpdates
+        return ActionEventResponse(id: try requireID(), nestId: $nest.id, entityId: $entity.id,
             actionId: $action.id, actorUserId: $actor.id, occurredAt: occurredAt,
             valueNumber: valueNumber, valueText: valueText, valueBool: valueBool,
             valueJSON: valueJSON, note: note, photoURL: photoURL,
+            photoUpdates: try resolvedPhotos.map { try $0.response() },
+            resolvedAt: resolvedAt, resolutionNote: resolutionNote,
             wasAccident: wasAccident, includeInPredictions: includeInPredictions)
+    }
+
+    func response(on db: any Database) async throws -> ActionEventResponse {
+        try response(photos: try await $photoUpdates.get(on: db))
+    }
+}
+
+extension ActionEventPhoto {
+    func response() throws -> ActionEventPhotoResponse {
+        ActionEventPhotoResponse(id: try requireID(), capturedAt: capturedAt, photoURL: photoURL)
     }
 }

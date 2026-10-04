@@ -53,6 +53,17 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
     @OptionalField(key: "photo_url")
     var photoURL: String?
 
+    @Children(for: \.$event)
+    var photoUpdates: [ActionEventPhoto]
+
+    /// A health event is open while this remains nil. The onset is stored in
+    /// `occurredAt`; this timestamp closes that same episode.
+    @OptionalField(key: "resolved_at")
+    var resolvedAt: Date?
+
+    @OptionalField(key: "resolution_note")
+    var resolutionNote: String?
+
     @Field(key: "was_accident")
     var wasAccident: Bool
 
@@ -77,6 +88,8 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         valueJSON: [String: String]? = nil,
         note: String? = nil,
         photoURL: String? = nil,
+        resolvedAt: Date? = nil,
+        resolutionNote: String? = nil,
         wasAccident: Bool = false,
         includeInPredictions: Bool = true
     ) {
@@ -92,6 +105,8 @@ final class ActionEvent: Model, Content, @unchecked Sendable {
         self.valueJSON = valueJSON
         self.note = note
         self.photoURL = photoURL
+        self.resolvedAt = resolvedAt
+        self.resolutionNote = resolutionNote
         self.wasAccident = wasAccident
         self.includeInPredictions = includeInPredictions
     }

@@ -15,6 +15,7 @@ enum ActionValueType: String, Codable {
     case boolean    // e.g. yes/no checks
     case json       // anything else structured
     case photo      // a photo stored in the nest's private photo storage
+    case health     // an episode with onset details, an optional photo, and resolution
 }
 
 final class TrackableAction: Model, Content, @unchecked Sendable {

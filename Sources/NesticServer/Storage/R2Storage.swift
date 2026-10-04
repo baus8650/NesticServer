@@ -79,6 +79,10 @@ final class R2Storage: @unchecked Sendable {
         "events/\(eventID.uuidString.lowercased())/photo.jpg"
     }
 
+    static func key(forEventPhotoID photoID: UUID) -> String {
+        "event-photo-updates/\(photoID.uuidString.lowercased()).jpg"
+    }
+
     static func reference(for key: String) -> String {
         "r2://\(key)"
     }

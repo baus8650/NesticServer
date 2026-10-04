@@ -214,7 +214,7 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
 
         event.photoURL = R2Storage.reference(for: key)
         try await event.save(on: req.db)
-        let response = try event.response()
+        let response = try await event.response(on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
         return response
     }
@@ -253,7 +253,105 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
         }
         event.photoURL = nil
         try await event.save(on: req.db)
-        let response = try event.response()
+        let response = try await event.response(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
+    }
+
+    protected.post("events", ":eventID", "photos") { req async throws -> ActionEventResponse in
+        guard let storage = req.application.r2Storage else {
+            throw Abort(.serviceUnavailable, reason: "Photo storage is not configured on the server")
+        }
+
+        let (event, nestID, userID) = try await editableEvent(for: req)
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events can have photo updates")
+        }
+        let contentType = req.headers.contentType?.description.lowercased() ?? "image/jpeg"
+        guard supportedPhotoContentTypes.contains(contentType) else {
+            throw Abort(.unsupportedMediaType, reason: "Health event photos must be JPEG images")
+        }
+        let maximumPhotoBytes = req.application.r2UsageLimiter.limits.maxUploadBytesPerPhoto
+        if let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
+           contentLength > maximumPhotoBytes {
+            throw R2UsageLimitError.photoTooLarge(maxBytes: maximumPhotoBytes).abort
+        }
+        guard let body = req.body.data, body.readableBytes > 0 else {
+            throw Abort(.badRequest, reason: "The health event photo is empty")
+        }
+
+        let photoID = UUID()
+        let key = R2Storage.key(forEventPhotoID: photoID)
+        let byteCount = Int64(body.readableBytes)
+        do {
+            try await req.application.r2UsageLimiter.reserveUpload(userID: userID, bytes: byteCount)
+        } catch let error as R2UsageLimitError {
+            throw error.abort
+        }
+        do {
+            try await storage.put(key: key, body: body, contentType: contentType, logger: req.logger)
+            let photo = ActionEventPhoto(id: photoID, eventID: try event.requireID(), actorUserID: userID,
+                                         capturedAt: Date(), photoURL: R2Storage.reference(for: key))
+            try await photo.save(on: req.db)
+        } catch {
+            await req.application.r2UsageLimiter.refundUpload(userID: userID, bytes: byteCount)
+            try? await storage.delete(key: key, logger: req.logger)
+            throw error
+        }
+
+        let response = try await event.response(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
+    }
+
+    protected.get("events", ":eventID", "photos", ":photoID") { req async throws -> Response in
+        guard let storage = req.application.r2Storage else {
+            throw Abort(.serviceUnavailable, reason: "Photo storage is not configured on the server")
+        }
+
+        let event = try await readableEvent(for: req)
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events have photo updates")
+        }
+        let photoID = try req.parameters.require("photoID", as: UUID.self)
+        guard let photo = try await ActionEventPhoto.find(photoID, on: req.db),
+              photo.$event.id == event.id,
+              let key = R2Storage.key(from: photo.photoURL) else {
+            throw Abort(.notFound, reason: "Health event photo not found")
+        }
+        do {
+            try await req.application.r2UsageLimiter.reserveRead(userID: try req.requireUserID())
+        } catch let error as R2UsageLimitError {
+            throw error.abort
+        }
+        guard let body = try await storage.get(key: key, logger: req.logger) else {
+            throw Abort(.notFound, reason: "This health event photo is unavailable")
+        }
+
+        var headers = HTTPHeaders()
+        headers.replaceOrAdd(name: .contentType, value: "image/jpeg")
+        return Response(status: .ok, headers: headers, body: .init(buffer: body))
+    }
+
+    protected.delete("events", ":eventID", "photos", ":photoID") { req async throws -> ActionEventResponse in
+        guard let storage = req.application.r2Storage else {
+            throw Abort(.serviceUnavailable, reason: "Photo storage is not configured on the server")
+        }
+
+        let (event, nestID, _) = try await editableEvent(for: req)
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events have photo updates")
+        }
+        let photoID = try req.parameters.require("photoID", as: UUID.self)
+        guard let photo = try await ActionEventPhoto.find(photoID, on: req.db),
+              photo.$event.id == event.id else {
+            throw Abort(.notFound, reason: "Health event photo not found")
+        }
+        if let key = R2Storage.key(from: photo.photoURL) {
+            try? await storage.delete(key: key, logger: req.logger)
+        }
+        try await photo.delete(on: req.db)
+        let response = try await event.response(on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
         return response
     }

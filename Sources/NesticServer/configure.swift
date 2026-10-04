@@ -61,6 +61,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateActionEvents())
     app.migrations.add(AddActionEventMetadata())
     app.migrations.add(AddActionEventPhoto())
+    app.migrations.add(AddActionEventHealth())
+    app.migrations.add(CreateActionEventPhotos())
     app.migrations.add(CreateEntityPinnedActions())
     app.migrations.add(CreateRoutines())
     app.migrations.add(AddRoutineTargets())
