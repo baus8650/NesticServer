@@ -337,6 +337,11 @@ struct CareLinkLogEventRequest: Content {
     let includeInPredictions: Bool?
 }
 
+struct CareLinkLogRoutineRequest: Content {
+    let occurredAt: Date?
+    let note: String?
+}
+
 private func careLinkTokenHash(_ token: String) -> String {
     SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
 }
@@ -473,6 +478,169 @@ func routes(_ app: Application) throws {
 
     app.get("health") { _ in
         return ["status": "ok"]
+    }
+
+    // MARK: - Public caregiver-link API
+    //
+    // These routes intentionally do not use the normal session middleware.
+    // The unguessable, hashed bearer token is the session, and every request
+    // re-checks its expiration, revocation state, and entity/tracker scope.
+    app.get("care-links", ":token") { req async throws -> CareLinkSnapshotResponse in
+        let link = try await activeCareLink(from: req)
+        guard let nest = try await Nest.find(link.$nest.id, on: req.db) else {
+            throw Abort(.notFound, reason: "Nest not found")
+        }
+
+        let entityIDs = Set(link.entityIDs)
+        let actionIDs = Set(link.actionIDs)
+        let entities = try await Entity.query(on: req.db)
+            .filter(\.$nest.$id == link.$nest.id)
+            .all()
+            .filter { entityIDs.contains($0.id ?? UUID()) }
+        let actions = try await TrackableAction.query(on: req.db)
+            .filter(\.$nest.$id == link.$nest.id)
+            .all()
+            .filter { actionIDs.contains($0.id ?? UUID()) }
+
+        let entityResponses = try entities.map { entity in
+            EntityResponse(id: try entity.requireID(), nestId: entity.$nest.id,
+                           kind: entity.kind, name: entity.name, tags: entity.tags,
+                           metadata: entity.metadata, birthday: entity.birthday,
+                           // Image references are private storage keys and are
+                           // deliberately not exposed through bearer links.
+                           imageURL: nil, pinnedActionIDs: [],
+                           createdAt: entity.createdAt, updatedAt: entity.updatedAt)
+        }
+        let actionResponses = try actions.map { action in
+            TrackableActionResponse(id: try action.requireID(), nestId: action.$nest.id,
+                                    name: action.name, valueType: action.valueType,
+                                    unit: action.unit, symbol: action.symbol,
+                                    color: action.color, groupName: action.groupName,
+                                    description: action.description,
+                                    createdAt: action.createdAt, updatedAt: action.updatedAt)
+        }
+
+        let routines = try await Routine.query(on: req.db)
+            .filter(\.$nest.$id == link.$nest.id)
+            .sort(\.$createdAt, .ascending)
+            .all()
+            .filter { routine in
+                let targets = routineTargets(routine)
+                return targets.allSatisfy { target in
+                    entityIDs.contains(target.entityID) &&
+                    target.items.allSatisfy { actionIDs.contains($0.trackerID) }
+                }
+            }
+            .map(routineResponse)
+
+        let events: [ActionEventResponse]
+        if link.canViewHistory {
+            let history = try await ActionEvent.query(on: req.db)
+                .filter(\.$nest.$id == link.$nest.id)
+                .filter(\.$entity.$id ~~ Array(entityIDs))
+                .filter(\.$action.$id ~~ Array(actionIDs))
+                .sort(\.$occurredAt, .descending)
+                .range(..<100)
+                .all()
+            events = try history.map(publicCareEventResponse)
+        } else {
+            events = []
+        }
+
+        return CareLinkSnapshotResponse(
+            link: try careLinkResponse(link), nestName: nest.name,
+            entities: entityResponses, actions: actionResponses,
+            routines: routines, events: events
+        )
+    }
+
+    app.post("care-links", ":token", "events") { req async throws -> ActionEventResponse in
+        let link = try await activeCareLink(from: req)
+        guard link.canLog else {
+            throw Abort(.forbidden, reason: "This caregiver link is view-only.")
+        }
+        let input = try req.content.decode(CareLinkLogEventRequest.self)
+        guard link.entityIDs.contains(input.entityID), link.actionIDs.contains(input.actionID) else {
+            throw Abort(.forbidden, reason: "This caregiver link does not include that subject or tracker.")
+        }
+        guard let entity = try await Entity.find(input.entityID, on: req.db),
+              entity.$nest.id == link.$nest.id,
+              let action = try await TrackableAction.find(input.actionID, on: req.db),
+              action.$nest.id == link.$nest.id else {
+            throw Abort(.badRequest, reason: "Subject or tracker not found in this nest.")
+        }
+
+        let occurredAt = input.occurredAt ?? Date()
+        try InputValidation.event(type: action.valueType, number: input.valueNumber,
+                                  text: input.valueText, boolean: input.valueBool,
+                                  json: input.valueJSON, note: input.note)
+        guard occurredAt.timeIntervalSinceNow <= 300 else {
+            throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
+        }
+        let event = ActionEvent(nestID: link.$nest.id, entityID: input.entityID,
+                                actionID: input.actionID, actorUserID: nil,
+                                occurredAt: occurredAt, valueNumber: input.valueNumber,
+                                valueText: input.valueText, valueBool: input.valueBool,
+                                valueJSON: input.valueJSON, note: input.note,
+                                wasAccident: input.wasAccident ?? false,
+                                includeInPredictions: input.includeInPredictions ?? true)
+        try await event.save(on: req.db)
+        let response = try publicCareEventResponse(event)
+        req.application.realtimeHub.broadcast(nestId: link.$nest.id,
+                                              type: "actionEvent.created", data: response)
+        return response
+    }
+
+    app.post("care-links", ":token", "routines", ":routineID", "log") { req async throws -> [ActionEventResponse] in
+        let link = try await activeCareLink(from: req)
+        guard link.canLog else {
+            throw Abort(.forbidden, reason: "This caregiver link is view-only.")
+        }
+        let routineID = try req.parameters.require("routineID", as: UUID.self)
+        guard let routine = try await Routine.find(routineID, on: req.db),
+              routine.$nest.id == link.$nest.id else {
+            throw Abort(.notFound, reason: "Routine not found")
+        }
+        let targets = routineTargets(routine)
+        guard targets.allSatisfy({ link.entityIDs.contains($0.entityID) &&
+                                   $0.items.allSatisfy { link.actionIDs.contains($0.trackerID) } }) else {
+            throw Abort(.forbidden, reason: "This caregiver link does not include every routine target.")
+        }
+        let input = try req.content.decode(CareLinkLogRoutineRequest.self)
+        let occurredAt = input.occurredAt ?? Date()
+        guard occurredAt.timeIntervalSinceNow <= 300 else {
+            throw Abort(.badRequest, reason: "Activity cannot be logged in the future.")
+        }
+        try await validateRoutineTargets(targets, nestID: link.$nest.id, on: req.db)
+        let trackerIDs = Array(Set(targets.flatMap { $0.items.map(\.trackerID) }))
+        let actions = try await TrackableAction.query(on: req.db)
+            .filter(\.$id ~~ trackerIDs).all()
+        let cleanNote = input.note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let events: [ActionEvent] = try await req.db.transaction { tx async throws -> [ActionEvent] in
+            var created: [ActionEvent] = []
+            for target in targets {
+                for item in target.items {
+                    guard let action = actions.first(where: { $0.id == item.trackerID }) else {
+                        throw Abort(.badRequest, reason: "A routine tracker is no longer available.")
+                    }
+                    let event = ActionEvent(nestID: link.$nest.id, entityID: target.entityID,
+                                            actionID: try action.requireID(), actorUserID: nil,
+                                            occurredAt: occurredAt, valueNumber: item.valueNumber,
+                                            valueText: item.valueText, valueBool: item.valueBool,
+                                            valueJSON: item.valueJSON,
+                                            note: cleanNote?.isEmpty == true ? nil : cleanNote)
+                    try await event.save(on: tx)
+                    created.append(event)
+                }
+            }
+            return created
+        }
+        let responses = try events.map(publicCareEventResponse)
+        for response in responses {
+            req.application.realtimeHub.broadcast(nestId: link.$nest.id,
+                                                  type: "actionEvent.created", data: response)
+        }
+        return responses
     }
 
     // Authenticate before upgrading so the first subscribe message cannot race JWT verification.
@@ -621,6 +789,118 @@ func routes(_ app: Application) throws {
             remindersJSON: settings.remindersJSON,
             updatedAt: settings.updatedAt
         )
+    }
+
+    // MARK: - Caregiver-link management
+
+    protected.get("nests", ":nestID", "care-links") { req async throws -> [NestCareLinkResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+
+        return try await NestCareLink.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .sort(\.$createdAt, .descending)
+            .all()
+            .map { try careLinkResponse($0) }
+    }
+
+    protected.post("nests", ":nestID", "care-links") { req async throws -> NestCareLinkResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+        guard try await Nest.find(nestID, on: req.db) != nil else {
+            throw Abort(.notFound, reason: "Nest not found")
+        }
+
+        let input = try req.content.decode(CreateNestCareLinkRequest.self)
+        let label = try InputValidation.name(input.label, field: "Link name")
+        let expiresAt = input.expiresAt
+        guard expiresAt.timeIntervalSinceNow >= 300 else {
+            throw Abort(.badRequest, reason: "A caregiver link must last at least five minutes.")
+        }
+        guard expiresAt.timeIntervalSinceNow <= 30 * 24 * 60 * 60 else {
+            throw Abort(.badRequest, reason: "A caregiver link cannot last more than 30 days.")
+        }
+        guard input.canLog || input.canViewHistory else {
+            throw Abort(.badRequest, reason: "Choose at least one caregiver permission.")
+        }
+        let entityIDs = Array(Set(input.entityIDs))
+        let actionIDs = Array(Set(input.actionIDs))
+        guard !entityIDs.isEmpty, entityIDs.count <= 50,
+              !actionIDs.isEmpty, actionIDs.count <= 50 else {
+            throw Abort(.badRequest, reason: "Choose between one and 50 subjects and trackers.")
+        }
+
+        let entities = try await Entity.query(on: req.db)
+            .filter(\.$id ~~ entityIDs).all()
+        guard entities.count == entityIDs.count,
+              entities.allSatisfy({ $0.$nest.id == nestID }) else {
+            throw Abort(.badRequest, reason: "Every selected subject must belong to this nest.")
+        }
+        let actions = try await TrackableAction.query(on: req.db)
+            .filter(\.$id ~~ actionIDs).all()
+        guard actions.count == actionIDs.count,
+              actions.allSatisfy({ $0.$nest.id == nestID }) else {
+            throw Abort(.badRequest, reason: "Every selected tracker must belong to this nest.")
+        }
+
+        let rawToken = newCareLinkToken()
+        let link = NestCareLink(nestID: nestID, createdByUserID: session.userId,
+                                tokenHash: careLinkTokenHash(rawToken), label: label,
+                                expiresAt: expiresAt, entityIDs: entityIDs,
+                                actionIDs: actionIDs, canLog: input.canLog,
+                                canViewHistory: input.canViewHistory)
+        try await link.save(on: req.db)
+        return try careLinkResponse(link, token: rawToken)
+    }
+
+    protected.delete("nests", ":nestID", "care-links", ":linkID") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let linkID = try req.parameters.require("linkID", as: UUID.self)
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { query in
+                query.filter(\.$role == .owner)
+                query.filter(\.$role == .admin)
+            }
+            .first() != nil
+        guard canManage else {
+            throw Abort(.forbidden, reason: "Owner or admin role required")
+        }
+        guard let link = try await NestCareLink.query(on: req.db)
+            .filter(\.$id == linkID)
+            .filter(\.$nest.$id == nestID)
+            .first() else {
+            throw Abort(.notFound, reason: "Caregiver link not found")
+        }
+        if link.revokedAt == nil {
+            link.revokedAt = Date()
+            try await link.save(on: req.db)
+        }
+        return .noContent
     }
 
     // MARK: - Nest Membership API

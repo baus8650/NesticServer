@@ -26,6 +26,14 @@ Create an account in the app. Password accounts receive a verification email bef
 
 Sample database data is opt-in: use `SEED_DEMO_DATA=true swift run NesticServer migrate --yes` in development. That creates the legacy `test@nestic.local` / `password` account. Do not enable it on a hosted service. The app's local demo is independent of this database.
 
+For App Review, the server includes a separate, neutral fixture that creates `test@test.com` with a verified email, an `App Review Nest`, multiple subjects and trackers, dated history, an open and resolved health event, a text update, a routine, prediction settings, quiet hours, and a reminder. It is deliberately one-shot and must be enabled explicitly for one deployment:
+
+```sh
+SEED_APP_REVIEW_DATA=true APP_REVIEW_SEED_PASSWORD='set-this-in-Railway' AUTO_MIGRATE=true swift run NesticServer serve
+```
+
+Set `APP_REVIEW_SEED_PASSWORD` to the password you will give App Review, but do not commit it. After the deployment has started successfully, remove `SEED_APP_REVIEW_DATA` and `APP_REVIEW_SEED_PASSWORD`; the migration record keeps the fixture from being recreated. Add `test@test.com` to `NESTIC_MANUAL_PRO_EMAILS` if the review account should exercise Pro-only screens. The fixture does not overwrite an existing App Review nest that already contains data.
+
 ## Railway preparation
 
 The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile and `railway.json` are included; no service or DNS has been deployed. The native server and PostgreSQL integration were tested locally; the production Docker image still needs its first container build on Railway. Railway uses the process's `PORT` variable, and the server listens on `0.0.0.0`. The supplied configuration sets `/health` as the deployment healthcheck. See [Railway configuration](https://docs.railway.com/config-as-code/reference) and [healthchecks](https://docs.railway.com/deployments/healthchecks).

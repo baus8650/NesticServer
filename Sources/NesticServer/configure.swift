@@ -74,6 +74,11 @@ public func configure(_ app: Application) async throws {
     if app.environment == .development && Environment.get("SEED_DEMO_DATA") == "true" {
         app.migrations.add(SeedDevelopmentData())
     }
+    // Hosted App Review data is opt-in and one-shot. The password is supplied
+    // through APP_REVIEW_SEED_PASSWORD and is never stored in source control.
+    if Environment.get("SEED_APP_REVIEW_DATA") == "true" {
+        app.migrations.add(SeedAppReviewData())
+    }
     _ = app.realtimeHub
     try routes(app)
 }
