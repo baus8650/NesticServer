@@ -1567,7 +1567,12 @@ func routes(_ app: Application) throws {
             return created
         }
 
-        let responses = try events.map { try $0.response() }
+        // These events were just created and cannot have photo updates yet.
+        // Do not access the @Children relation here: Fluent traps when a
+        // children relationship has not been eager-loaded, which previously
+        // turned routine logging into a server-side 502 after health events
+        // added photoUpdates to ActionEventResponse.
+        let responses = try events.map { try $0.response(photos: []) }
         for response in responses {
             req.application.realtimeHub.broadcast(nestId: nestID, type: "actionEvent.created", data: response)
         }

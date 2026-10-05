@@ -208,6 +208,13 @@ struct PostgresIntegrationTests {
             let routineResponse = try routine.content.decode(RoutineResponse.self)
             #expect(routineResponse.items.count == 1)
             #expect(routineResponse.targets.count == 1)
+            let loggedRoutine = try await api.sendRequest(.POST, "routines/\(routineResponse.id)/log", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(["note": "Routine test"])
+            })
+            #expect(loggedRoutine.status == .ok)
+            let loggedEvents = try loggedRoutine.content.decode([ActionEventResponse].self)
+            #expect(loggedEvents.count == 1)
+            #expect(loggedEvents[0].photoUpdates.isEmpty)
             let addedOwner = try await api.sendRequest(.POST, "nests/\(nest.id)/members", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["email": "coowner-\(suffix)@example.com", "role": "owner"])
             })
