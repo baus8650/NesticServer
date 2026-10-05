@@ -117,6 +117,19 @@ struct NestResponse: Content {
     let updatedAt: Date?
 }
 
+struct NestUserSettingsResponse: Content {
+    let predictionPreferencesJSON: String?
+    let quietHoursJSON: String?
+    let remindersJSON: String?
+    let updatedAt: Date?
+}
+
+struct UpdateNestUserSettingsRequest: Content {
+    let predictionPreferencesJSON: String?
+    let quietHoursJSON: String?
+    let remindersJSON: String?
+}
+
 struct EntityResponse: Content {
     let id: UUID
     let nestId: UUID
@@ -467,6 +480,58 @@ func routes(_ app: Application) throws {
         }
 
         return NestResponse(id: try nest.requireID(), name: nest.name, createdAt: nest.createdAt, updatedAt: nest.updatedAt)
+    }
+
+    // Per-user settings are stored on the server so a reinstall or a second
+    // device can restore the user's forecast, quiet-hour, and reminder setup.
+    protected.get("nests", ":nestID", "settings") { req async throws -> NestUserSettingsResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+
+        let settings = try await NestUserSettings.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first()
+        return NestUserSettingsResponse(
+            predictionPreferencesJSON: settings?.predictionPreferencesJSON,
+            quietHoursJSON: settings?.quietHoursJSON,
+            remindersJSON: settings?.remindersJSON,
+            updatedAt: settings?.updatedAt
+        )
+    }
+
+    protected.put("nests", ":nestID", "settings") { req async throws -> NestUserSettingsResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+
+        let input = try req.content.decode(UpdateNestUserSettingsRequest.self)
+        let settings = try await NestUserSettings.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() ?? NestUserSettings(nestID: nestID, userID: session.userId)
+        settings.predictionPreferencesJSON = input.predictionPreferencesJSON
+        settings.quietHoursJSON = input.quietHoursJSON
+        settings.remindersJSON = input.remindersJSON
+        try await settings.save(on: req.db)
+
+        return NestUserSettingsResponse(
+            predictionPreferencesJSON: settings.predictionPreferencesJSON,
+            quietHoursJSON: settings.quietHoursJSON,
+            remindersJSON: settings.remindersJSON,
+            updatedAt: settings.updatedAt
+        )
     }
 
     // MARK: - Nest Membership API

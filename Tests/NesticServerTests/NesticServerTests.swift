@@ -15,6 +15,12 @@ private struct RoutineRequest: Content {
     let items: [RoutineItem]
 }
 
+private struct UserSettingsRequest: Content {
+    let predictionPreferencesJSON: String?
+    let quietHoursJSON: String?
+    let remindersJSON: String?
+}
+
 @Suite("API boundaries", .serialized)
 struct NesticServerTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -43,7 +49,7 @@ struct NesticServerTests {
     func unauthenticated() async throws {
         try await withApp { app in
             let nestID = UUID()
-            for route in ["auth/me", "nests", "nests/\(nestID)/events", "nests/\(nestID)/members"] {
+            for route in ["auth/me", "nests", "nests/\(nestID)/events", "nests/\(nestID)/members", "nests/\(nestID)/settings"] {
                 try await app.testing().test(.GET, route) { response async in
                     #expect(response.status == .unauthorized)
                 }
@@ -180,6 +186,19 @@ struct PostgresIntegrationTests {
                 try req.content.encode(["name": "Integration nest"])
             })
             let nest = try nestResponse.content.decode(NestResponse.self)
+            let savedSettings = try await api.sendRequest(.PUT, "nests/\(nest.id)/settings", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(UserSettingsRequest(
+                    predictionPreferencesJSON: "{\"subject\":\"prefs\"}",
+                    quietHoursJSON: "{\"periods\":[]}",
+                    remindersJSON: "[]"
+                ))
+            })
+            #expect(savedSettings.status == .ok)
+            let loadedSettings = try await api.sendRequest(.GET, "nests/\(nest.id)/settings", headers: owner)
+            let settings = try loadedSettings.content.decode(NestUserSettingsResponse.self)
+            #expect(settings.predictionPreferencesJSON == "{\"subject\":\"prefs\"}")
+            #expect(settings.quietHoursJSON == "{\"periods\":[]}")
+            #expect(settings.remindersJSON == "[]")
             let entityResponse = try await api.sendRequest(.POST, "nests/\(nest.id)/entities", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["name": "Milo", "kind": "pet"])
             })
