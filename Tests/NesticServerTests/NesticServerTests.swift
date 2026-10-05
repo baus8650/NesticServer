@@ -152,10 +152,77 @@ struct NesticServerTests {
         #expect(!json.contains("private-hash"))
         #expect(!json.contains("password"))
     }
+
+    @Test("An allowlisted email cannot grant admin access before verification")
+    func verifiedAdminIdentity() {
+        let user = User(email: "baus8650@gmail.com", passwordHash: "unused", displayName: "Admin")
+        #expect(!isNesticAdmin(user))
+        user.emailVerified = true
+        #expect(isNesticAdmin(user))
+        user.email = "someone-else@example.com"
+        #expect(!isNesticAdmin(user))
+    }
 }
 
 @Suite("Postgres integration", .serialized, .enabled(if: Environment.get("RUN_DATABASE_TESTS") == "true"))
 struct PostgresIntegrationTests {
+    @Test("Account deletion removes authored shared content and queues every attached photo")
+    func accountDeletion() async throws {
+        let app = try await Application.make(.testing)
+        let suffix = UUID().uuidString
+        let departing = User(email: "departing-\(suffix)@example.com", passwordHash: "unused", displayName: "Departing", emailVerified: true)
+        let remaining = User(email: "remaining-\(suffix)@example.com", passwordHash: "unused", displayName: "Remaining", emailVerified: true)
+        let nest = Nest(name: "Deletion regression")
+        do {
+            try await configure(app)
+            try await app.autoMigrate()
+            try await departing.save(on: app.db)
+            try await remaining.save(on: app.db)
+            try await nest.save(on: app.db)
+            let userID = try departing.requireID()
+            let nestID = try nest.requireID()
+            try await NestMember(nestID: nestID, userID: userID, role: .owner).save(on: app.db)
+            try await NestMember(nestID: nestID, userID: remaining.requireID(), role: .member).save(on: app.db)
+            let entity = Entity(nestID: nestID, kind: .pet, name: "Test subject")
+            let tracker = TrackableAction(nestID: nestID, name: "Health", valueType: .health)
+            try await entity.save(on: app.db)
+            try await tracker.save(on: app.db)
+            let event = ActionEvent(nestID: nestID, entityID: try entity.requireID(), actionID: try tracker.requireID(),
+                                    actorUserID: userID, occurredAt: Date(), valueText: "Recorded details", photoURL: "r2://\(suffix)/onset.jpg")
+            let keptEvent = ActionEvent(nestID: nestID, entityID: try entity.requireID(), actionID: try tracker.requireID(),
+                                        actorUserID: try remaining.requireID(), occurredAt: Date(), valueText: "Other member’s details")
+            try await event.save(on: app.db)
+            try await keptEvent.save(on: app.db)
+            let progress = ActionEventPhoto(eventID: try keptEvent.requireID(), actorUserID: userID,
+                                            capturedAt: Date(), photoURL: "r2://\(suffix)/progress.jpg", note: "Departing member’s note")
+            try await progress.save(on: app.db)
+            let feedback = FeedbackThread(userID: userID, subject: "Test", category: "question")
+            try await feedback.save(on: app.db)
+            let jwt = try await app.jwt.keys.sign(SessionToken(userId: userID))
+            let response = try await app.testing().sendRequest(.DELETE, "auth/me", headers: ["Authorization": "Bearer \(jwt)"])
+            #expect(response.status == .ok)
+            #expect(try response.content.decode(AccountDeletionResponse.self).deleted)
+            #expect(try await User.find(userID, on: app.db) == nil)
+            #expect(try await ActionEvent.find(event.requireID(), on: app.db) == nil)
+            #expect(try await ActionEventPhoto.find(progress.requireID(), on: app.db) == nil)
+            #expect(try await FeedbackThread.find(feedback.requireID(), on: app.db) == nil)
+            #expect(try await ActionEvent.find(keptEvent.requireID(), on: app.db) != nil)
+            let owner = try await NestMember.query(on: app.db).filter(\.$nest.$id == nestID).first()
+            #expect(owner?.role == .owner)
+            #expect(owner?.$user.id == remaining.id)
+            let jobs = try await PhotoDeletionJob.query(on: app.db).all()
+            #expect(jobs.filter { $0.objectKey.hasPrefix(suffix) }.count == 2)
+            for job in jobs where job.objectKey.hasPrefix(suffix) { try await job.delete(on: app.db) }
+            try await keptEvent.delete(on: app.db)
+            try await nest.delete(on: app.db)
+            try await remaining.delete(on: app.db)
+            try await app.asyncShutdown()
+        } catch {
+            try await app.asyncShutdown()
+            throw error
+        }
+    }
+
     @Test("Shared nest logging, cross-nest isolation, viewer permissions, and deletion")
     func sharedNest() async throws {
         // This suite creates isolated test users and cleans up ONLY their rows. It never reverts migrations.
@@ -261,13 +328,16 @@ struct PostgresIntegrationTests {
             let event = try created.content.decode(ActionEventResponse.self)
             #expect(event.actorUserId == userIDs[1])
             let feed = try await api.sendRequest(.GET, "nests/\(nest.id)/events?limit=200", headers: owner)
-            #expect(try feed.content.decode([ActionEventResponse].self).count == 1)
+            let feedEvents = try feed.content.decode([ActionEventResponse].self)
+            #expect(feedEvents.count == loggedEvents.count + 1)
+            #expect(feedEvents.contains { $0.id == event.id })
             let denied = try await api.sendRequest(.GET, "nests/\(nest.id)/events", headers: outsider)
             #expect(denied.status == .forbidden)
             let deleted = try await api.sendRequest(.DELETE, "events/\(event.id)", headers: member)
             #expect(deleted.status == HTTPStatus.noContent)
             let empty = try await api.sendRequest(.GET, "nests/\(nest.id)/events", headers: owner)
-            #expect(try empty.content.decode([ActionEventResponse].self).isEmpty)
+            let remainingEvents = try empty.content.decode([ActionEventResponse].self)
+            #expect(Set(remainingEvents.map(\.id)) == Set(loggedEvents.map(\.id)))
             let deletedAction = try await api.sendRequest(.DELETE, "actions/\(action.id)", headers: owner)
             #expect(deletedAction.status == HTTPStatus.noContent)
             let actionsAfterDelete = try await api.sendRequest(.GET, "nests/\(nest.id)/actions", headers: owner)

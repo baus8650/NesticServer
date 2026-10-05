@@ -100,6 +100,13 @@ struct AppleSignInRequest: Content {
     let nonce: String?
 }
 
+struct AppleDeletionRequest: Content {
+    let identityToken: String
+    let user: String
+    let nonce: String
+    let authorizationCode: String
+}
+
 private func appleClientIDs() -> [String] {
     let configured = Environment.get("APPLE_CLIENT_IDS")
         ?? Environment.get("APPLE_CLIENT_ID")
@@ -248,7 +255,7 @@ func authRoutes(_ app: Application) throws {
             return TokenResponse(token: try await req.jwt.sign(SessionToken(with: existing)))
         }
 
-        guard let rawEmail = identity.email ?? input.email,
+        guard let rawEmail = identity.email,
               let email = try? InputValidation.email(rawEmail) else {
             throw Abort(.badRequest, reason: "Apple did not provide an email address. Please try again.")
         }
@@ -370,11 +377,34 @@ func authRoutes(_ app: Application) throws {
     /// oldest administrator/member is promoted to owner so the nest never gets
     /// stranded. A nest owned only by the deleting account is removed with its
     /// entities, trackers, and activity. R2 avatars are cleaned up after the
-    /// database transaction on a best-effort basis.
+    /// database transaction through a durable retry queue.
     protected.delete("auth", "me") { req async throws -> AccountDeletionResponse in
         let session = try req.auth.require(SessionToken.self)
         guard let user = try await User.find(session.userId, on: req.db) else {
             throw Abort(.unauthorized, reason: "That account no longer exists.")
+        }
+
+        var appleAccessRevoked = user.appleSubject == nil
+        if user.appleSubject != nil, (req.body.data?.readableBytes ?? 0) > 0 {
+            let input = try req.content.decode(AppleDeletionRequest.self)
+            let identity = try await verifyAppleIdentity(req, input: AppleSignInRequest(
+                identityToken: input.identityToken, user: input.user, email: nil,
+                displayName: nil, nonce: input.nonce))
+            guard identity.subject.value == user.appleSubject else {
+                throw Abort(.forbidden, reason: "Confirm with the Apple account linked to Nestic.")
+            }
+            if let clientID = appleClientIDs().first(where: {
+                (try? identity.audience.verifyIntendedAudience(includes: $0)) != nil
+            }) {
+                do {
+                    try await revokeAppleAuthorization(on: req, code: input.authorizationCode, clientID: clientID)
+                    appleAccessRevoked = true
+                } catch {
+                    // Fulfill deletion even when Apple is unavailable; the
+                    // response lets the app explain manual Apple revocation.
+                    req.logger.warning("Apple authorization could not be revoked during account deletion")
+                }
+            }
         }
 
         let memberships = try await NestMember.query(on: req.db)
@@ -401,8 +431,29 @@ func authRoutes(_ app: Application) throws {
             avatarKeysToDelete.append(contentsOf: entities.compactMap { R2Storage.key(from: $0.imageURL) })
         }
         let deletableNestIDs = Set(nestIDsToDelete)
+        // Delete authored content even when the shared nest survives. Collect
+        // every attached object before cascading away its database reference.
+        let eventsToDelete = try await ActionEvent.query(on: req.db)
+            .group(.or) { group in
+                group.filter(\.$actor.$id == session.userId)
+                if !nestIDsToDelete.isEmpty { group.filter(\.$nest.$id ~~ nestIDsToDelete) }
+            }.all()
+        let eventIDsToDelete = eventsToDelete.compactMap(\.id)
+        avatarKeysToDelete.append(contentsOf: eventsToDelete.compactMap { R2Storage.key(from: $0.photoURL) })
+        let updatesToDelete = try await ActionEventPhoto.query(on: req.db)
+            .group(.or) { group in
+                group.filter(\.$actor.$id == session.userId)
+                if !eventIDsToDelete.isEmpty { group.filter(\.$event.$id ~~ eventIDsToDelete) }
+            }.all()
+        avatarKeysToDelete.append(contentsOf: updatesToDelete.compactMap { R2Storage.key(from: $0.photoURL) })
+        let objectKeysToDelete = Set(avatarKeysToDelete)
 
         try await req.db.transaction { tx in
+            for key in objectKeysToDelete {
+                try await PhotoDeletionJob(objectKey: key).save(on: tx)
+            }
+            for update in updatesToDelete { try await update.delete(on: tx) }
+            for event in eventsToDelete { try await event.delete(on: tx) }
             for nestID in ownedNestIDs {
                 let nestMembers = try await NestMember.query(on: tx)
                     .filter(\.$nest.$id == nestID)
@@ -426,19 +477,15 @@ func authRoutes(_ app: Application) throws {
         for nestID in memberships.map({ $0.$nest.id }) {
             req.application.realtimeHub.disconnect(userId: session.userId, nestId: nestID)
         }
-        if let storage = req.application.r2Storage {
-            for key in avatarKeysToDelete {
-                do { try await storage.delete(key: key, logger: req.logger) }
-                catch { req.logger.warning("Could not delete account avatar from R2", metadata: ["key": .string(key)]) }
-            }
-        }
+        await processPhotoDeletions(on: req.application)
 
-        return AccountDeletionResponse(deleted: true)
+        return AccountDeletionResponse(deleted: true, appleAccessRevoked: appleAccessRevoked)
     }
 }
 
 struct AccountDeletionResponse: Content {
     let deleted: Bool
+    let appleAccessRevoked: Bool
 }
 
 private func ownerReplacementOrder(_ lhs: NestMember, _ rhs: NestMember) -> Bool {

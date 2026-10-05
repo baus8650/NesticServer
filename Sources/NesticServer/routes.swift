@@ -1119,7 +1119,18 @@ func routes(_ app: Application) throws {
             nestId: nestID
         )
 
-        try await membership.delete(on: req.db)
+        try await req.db.transaction { tx in
+            // Removing membership must also close any bearer links created by
+            // this person, so those links cannot bypass the removal.
+            let links = try await NestCareLink.query(on: tx)
+                .filter(\.$nest.$id == nestID)
+                .filter(\.$createdBy.$id == targetUserID).all()
+            for link in links {
+                link.revokedAt = Date()
+                try await link.save(on: tx)
+            }
+            try await membership.delete(on: tx)
+        }
         req.application.realtimeHub.disconnect(userId: targetUserID, nestId: nestID)
         req.application.realtimeHub.broadcast(
             nestId: nestID,

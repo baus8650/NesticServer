@@ -13,7 +13,7 @@ func nesticAdminEmails() -> Set<String> {
 }
 
 func isNesticAdmin(_ user: User) -> Bool {
-    nesticAdminEmails().contains(user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    user.emailVerified && nesticAdminEmails().contains(user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
 }
 
 extension Request {

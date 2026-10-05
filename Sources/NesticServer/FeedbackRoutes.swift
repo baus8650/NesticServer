@@ -74,7 +74,7 @@ struct AdminDashboardResponse: Content {
 private func feedbackText(_ value: String, field: String) throws -> String {
     let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !clean.isEmpty, clean.count <= 4000 else {
-        throw Abort(.badRequest, reason: "(field) must contain 1–4,000 characters.")
+        throw Abort(.badRequest, reason: "\(field) must contain 1–4,000 characters.")
     }
     return clean
 }
