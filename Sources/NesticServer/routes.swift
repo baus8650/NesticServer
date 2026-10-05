@@ -1,6 +1,7 @@
 import Fluent
 import Vapor
 import JWT
+import Crypto
 import NIOConcurrencyHelpers
 // MARK: - Realtime (WebSockets)
 
@@ -289,6 +290,94 @@ struct RoutineResponse: Content {
 struct RoutineDeletedResponse: Content {
     let id: UUID
     let nestId: UUID
+}
+
+struct NestCareLinkResponse: Content {
+    let id: UUID
+    let nestId: UUID
+    let label: String
+    let expiresAt: Date
+    let entityIDs: [UUID]
+    let actionIDs: [UUID]
+    let canLog: Bool
+    let canViewHistory: Bool
+    let revokedAt: Date?
+    let createdAt: Date?
+    let token: String?
+}
+
+struct CreateNestCareLinkRequest: Content {
+    let label: String
+    let expiresAt: Date
+    let entityIDs: [UUID]
+    let actionIDs: [UUID]
+    let canLog: Bool
+    let canViewHistory: Bool
+}
+
+struct CareLinkSnapshotResponse: Content {
+    let link: NestCareLinkResponse
+    let nestName: String
+    let entities: [EntityResponse]
+    let actions: [TrackableActionResponse]
+    let routines: [RoutineResponse]
+    let events: [ActionEventResponse]
+}
+
+struct CareLinkLogEventRequest: Content {
+    let entityID: UUID
+    let actionID: UUID
+    let occurredAt: Date?
+    let valueNumber: Double?
+    let valueText: String?
+    let valueBool: Bool?
+    let valueJSON: [String: String]?
+    let note: String?
+    let wasAccident: Bool?
+    let includeInPredictions: Bool?
+}
+
+private func careLinkTokenHash(_ token: String) -> String {
+    SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
+private func newCareLinkToken() -> String {
+    var bytes = [UInt8](repeating: 0, count: 32)
+    for index in bytes.indices { bytes[index] = UInt8.random(in: .min ... .max) }
+    return Data(bytes).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+
+private func careLinkResponse(_ link: NestCareLink, token: String? = nil) throws -> NestCareLinkResponse {
+    NestCareLinkResponse(id: try link.requireID(), nestId: link.$nest.id, label: link.label,
+                         expiresAt: link.expiresAt, entityIDs: link.entityIDs,
+                         actionIDs: link.actionIDs, canLog: link.canLog,
+                         canViewHistory: link.canViewHistory, revokedAt: link.revokedAt,
+                         createdAt: link.createdAt, token: token)
+}
+
+private func activeCareLink(from req: Request) async throws -> NestCareLink {
+    let token = try req.parameters.require("token")
+    guard token.count >= 32, let link = try await NestCareLink.query(on: req.db)
+        .filter(\.$tokenHash == careLinkTokenHash(token))
+        .first(), link.revokedAt == nil, link.expiresAt > Date() else {
+        throw Abort(.notFound, reason: "This caregiver link is expired or no longer available.")
+    }
+    return link
+}
+
+private func publicCareEventResponse(_ event: ActionEvent) throws -> ActionEventResponse {
+    ActionEventResponse(id: try event.requireID(), nestId: event.$nest.id,
+                        entityId: event.$entity.id, actionId: event.$action.id,
+                        actorUserId: nil, occurredAt: event.occurredAt,
+                        valueNumber: event.valueNumber, valueText: event.valueText,
+                        valueBool: event.valueBool, valueJSON: event.valueJSON,
+                        note: event.note, photoURL: nil, photoUpdates: [],
+                        resolvedAt: event.resolvedAt, resolutionNote: event.resolutionNote,
+                        wasAccident: event.wasAccident,
+                        includeInPredictions: event.includeInPredictions)
 }
 
 private func routineResponse(_ routine: Routine) throws -> RoutineResponse {

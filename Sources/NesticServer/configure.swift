@@ -53,6 +53,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateAuthTokens())
     app.migrations.add(CreateNests())
     app.migrations.add(CreateNestMembers())
+    app.migrations.add(CreateNestCareLinks())
     app.migrations.add(CreateNestUserSettings())
     app.migrations.add(CreateEntities())
     app.migrations.add(CreateTrackableActions())
