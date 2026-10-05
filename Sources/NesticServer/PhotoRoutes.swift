@@ -7,6 +7,48 @@ private let supportedPhotoContentTypes: Set<String> = [
     "image/jpg"
 ]
 
+private struct HealthUpdateMetadata: Content {
+    let capturedAt: String?
+    let note: String?
+}
+
+private func healthUpdateDate(_ value: String?, onset: Date) throws -> Date {
+    let date: Date
+    if let value {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let parsed = formatter.date(from: value) {
+            date = parsed
+        } else {
+            formatter.formatOptions = [.withInternetDateTime]
+            guard let parsed = formatter.date(from: value) else {
+                throw Abort(.badRequest, reason: "Choose a valid update time.")
+            }
+            date = parsed
+        }
+    } else {
+        date = Date()
+    }
+    guard date >= onset else {
+        throw Abort(.badRequest, reason: "A health update cannot be recorded before onset.")
+    }
+    guard date.timeIntervalSinceNow <= 300 else {
+        throw Abort(.badRequest, reason: "A health update cannot be recorded in the future.")
+    }
+    return date
+}
+
+private func healthUpdateNote(_ value: String?, required: Bool) throws -> String? {
+    let cleaned = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard (cleaned?.count ?? 0) <= 2_000 else {
+        throw Abort(.badRequest, reason: "Health update notes are limited to 2,000 characters")
+    }
+    if required && (cleaned?.isEmpty != false) {
+        throw Abort(.badRequest, reason: "Add a note or choose a photo for this update")
+    }
+    return cleaned?.isEmpty == true ? nil : cleaned
+}
+
 private func editableEntity(for req: Request) async throws -> (Entity, UUID) {
     let session = try req.auth.require(SessionToken.self)
     let entityID = try req.parameters.require("entityID", as: UUID.self)
@@ -267,6 +309,9 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
         guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
             throw Abort(.badRequest, reason: "Only health events can have photo updates")
         }
+        let metadata = (try? req.query.decode(HealthUpdateMetadata.self)) ?? HealthUpdateMetadata(capturedAt: nil, note: nil)
+        let capturedAt = try healthUpdateDate(metadata.capturedAt, onset: event.occurredAt)
+        let note = try healthUpdateNote(metadata.note, required: false)
         let contentType = req.headers.contentType?.description.lowercased() ?? "image/jpeg"
         guard supportedPhotoContentTypes.contains(contentType) else {
             throw Abort(.unsupportedMediaType, reason: "Health event photos must be JPEG images")
@@ -291,7 +336,7 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
         do {
             try await storage.put(key: key, body: body, contentType: contentType, logger: req.logger)
             let photo = ActionEventPhoto(id: photoID, eventID: try event.requireID(), actorUserID: userID,
-                                         capturedAt: Date(), photoURL: R2Storage.reference(for: key))
+                                         capturedAt: capturedAt, photoURL: R2Storage.reference(for: key), note: note)
             try await photo.save(on: req.db)
         } catch {
             await req.application.r2UsageLimiter.refundUpload(userID: userID, bytes: byteCount)
@@ -299,6 +344,25 @@ func registerPhotoRoutes(_ protected: any RoutesBuilder) {
             throw error
         }
 
+        let response = try await event.response(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
+        return response
+    }
+
+    protected.post("events", ":eventID", "updates") { req async throws -> ActionEventResponse in
+        let (event, nestID, userID) = try await editableEvent(for: req)
+        guard let action = try await TrackableAction.find(event.$action.id, on: req.db), action.valueType == .health else {
+            throw Abort(.badRequest, reason: "Only health events can have text updates")
+        }
+        let input = try req.content.decode(HealthUpdateMetadata.self)
+        let capturedAt = try healthUpdateDate(input.capturedAt, onset: event.occurredAt)
+        guard let note = try healthUpdateNote(input.note, required: true) else {
+            throw Abort(.badRequest, reason: "Add a note for this update")
+        }
+
+        let update = ActionEventPhoto(id: UUID(), eventID: try event.requireID(), actorUserID: userID,
+                                      capturedAt: capturedAt, photoURL: "", note: note)
+        try await update.save(on: req.db)
         let response = try await event.response(on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "event.updated", data: response)
         return response

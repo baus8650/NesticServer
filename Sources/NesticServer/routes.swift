@@ -169,6 +169,7 @@ struct ActionEventPhotoResponse: Content {
     let id: UUID
     let capturedAt: Date
     let photoURL: String
+    let note: String?
 }
 
 struct UpdateEventRequest: Content {
@@ -1923,6 +1924,6 @@ extension ActionEvent {
 
 extension ActionEventPhoto {
     func response() throws -> ActionEventPhotoResponse {
-        ActionEventPhotoResponse(id: try requireID(), capturedAt: capturedAt, photoURL: photoURL)
+        ActionEventPhotoResponse(id: try requireID(), capturedAt: capturedAt, photoURL: photoURL, note: note)
     }
 }
