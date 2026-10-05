@@ -70,6 +70,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateRoutines())
     app.migrations.add(AddRoutineTargets())
     app.migrations.add(AddPerformanceIndexes())
+    app.migrations.add(CreateFeedback())
     // Real deployments and clean local accounts should never receive sample family data.
     if app.environment == .development && Environment.get("SEED_DEMO_DATA") == "true" {
         app.migrations.add(SeedDevelopmentData())
@@ -81,6 +82,7 @@ public func configure(_ app: Application) async throws {
     }
     _ = app.realtimeHub
     try routes(app)
+    try feedbackRoutes(app)
 }
 
 private func postgresConfiguration(for databaseURL: String) throws -> SQLPostgresConfiguration {

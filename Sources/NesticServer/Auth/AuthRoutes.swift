@@ -56,6 +56,7 @@ struct UserResponse: Content {
     let appleLinked: Bool
     let emailVerified: Bool
     let manualPro: Bool
+    let isAdmin: Bool
 
     init(_ user: User) throws {
         id = try user.requireID()
@@ -67,6 +68,7 @@ struct UserResponse: Content {
         appleLinked = user.appleSubject != nil
         emailVerified = user.emailVerified
         manualPro = manuallyUnlockedPro(for: user)
+        isAdmin = isNesticAdmin(user)
     }
 }
 
