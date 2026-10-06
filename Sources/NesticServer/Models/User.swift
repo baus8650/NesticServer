@@ -29,6 +29,12 @@ final class User: Model, Content, @unchecked Sendable {
     @OptionalField(key: "apple_subject")
     var appleSubject: String?
 
+    @OptionalField(key: "terms_version")
+    var termsVersion: String?
+
+    @OptionalField(key: "terms_accepted_at")
+    var termsAcceptedAt: Date?
+
     @Timestamp(key: "created_at", on: .create)
     var createdAt: Date?
 

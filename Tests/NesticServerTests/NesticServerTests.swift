@@ -81,6 +81,22 @@ struct NesticServerTests {
         try InputValidation.password("test-password")
     }
 
+    @Test("Signup requires explicit acceptance of the published terms version")
+    func termsAcceptanceRequired() async throws {
+        try NesticTerms.requireAcceptance(NesticTerms.currentVersion)
+        #expect(throws: (any Error).self) { try NesticTerms.requireAcceptance(nil) }
+        #expect(throws: (any Error).self) { try NesticTerms.requireAcceptance("outdated") }
+        try await withApp { app in
+            for version in [nil, "outdated"] as [String?] {
+                try await app.testing().test(.POST, "auth/register", beforeRequest: { request async throws in
+                    try request.content.encode(RegisterRequest(email: "consent@example.com", password: "test-password", displayName: "Alex", imageURL: nil, acceptedTermsVersion: version))
+                }, afterResponse: { response async in
+                    #expect(response.status == .preconditionRequired)
+                })
+            }
+        }
+    }
+
     @Test("Event payload must match its tracker and preserve boolean false")
     func typedEvents() throws {
         try InputValidation.event(type: .none, number: nil, text: nil, boolean: nil, json: nil, note: "Pee outside")
@@ -236,14 +252,18 @@ struct PostgresIntegrationTests {
             var tokens: [String] = []
             for name in ["owner", "member", "outsider", "coowner"] {
                 let response = try await api.sendRequest(.POST, "auth/register", beforeRequest: { req async throws in
-                    try req.content.encode(RegisterRequest(email: "\(name)-\(suffix)@example.com", password: "test-password", displayName: name, imageURL: nil))
+                    try req.content.encode(RegisterRequest(email: "\(name)-\(suffix)@example.com", password: "test-password", displayName: name, imageURL: nil, acceptedTermsVersion: NesticTerms.currentVersion))
                 })
                 #expect(response.status == .ok)
                 let token = try #require(response.content.decode(RegisterResponse.self).token)
                 tokens.append(token)
                 let profile = try await api.sendRequest(.GET, "auth/me", headers: ["Authorization": "Bearer \(token)"])
                 #expect(!profile.body.string.contains("password"))
-                userIDs.append(try profile.content.decode(UserResponse.self).id)
+                let registeredID = try profile.content.decode(UserResponse.self).id
+                userIDs.append(registeredID)
+                let registeredUser = try #require(try await User.find(registeredID, on: app.db))
+                #expect(registeredUser.termsVersion == NesticTerms.currentVersion)
+                #expect(registeredUser.termsAcceptedAt != nil)
             }
             let owner: HTTPHeaders = ["Authorization": "Bearer \(tokens[0])"]
             let member: HTTPHeaders = ["Authorization": "Bearer \(tokens[1])"]

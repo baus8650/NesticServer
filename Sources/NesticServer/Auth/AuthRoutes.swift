@@ -90,6 +90,7 @@ struct RegisterRequest: Content {
     let password: String
     let displayName: String
     let imageURL: String?
+    var acceptedTermsVersion: String? = nil
 }
 
 struct AppleSignInRequest: Content {
@@ -98,6 +99,17 @@ struct AppleSignInRequest: Content {
     let email: String?
     let displayName: String?
     let nonce: String?
+    var acceptedTermsVersion: String? = nil
+}
+
+enum NesticTerms {
+    static let currentVersion = "2026-10-05"
+
+    static func requireAcceptance(_ version: String?) throws {
+        guard version == currentVersion else {
+            throw Abort(.preconditionRequired, reason: "Please read and agree to the current Terms of Service before creating an account.")
+        }
+    }
 }
 
 struct AppleDeletionRequest: Content {
@@ -198,11 +210,14 @@ func authRoutes(_ app: Application) throws {
         let email = try InputValidation.email(input.email)
         let displayName = try InputValidation.name(input.displayName, field: "Display name")
         try InputValidation.password(input.password)
+        try NesticTerms.requireAcceptance(input.acceptedTermsVersion)
         if try await User.query(on: req.db).filter(\.$email == email).first() != nil {
             throw Abort(.conflict, reason: "Email already in use.")
         }
         let user = User(email: email, passwordHash: try await req.password.async.hash(input.password),
                         displayName: displayName, imageURL: input.imageURL)
+        user.termsVersion = input.acceptedTermsVersion
+        user.termsAcceptedAt = Date()
         do { try await user.save(on: req.db) }
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "Email already in use.")
@@ -255,6 +270,8 @@ func authRoutes(_ app: Application) throws {
             return TokenResponse(token: try await req.jwt.sign(SessionToken(with: existing)))
         }
 
+        try NesticTerms.requireAcceptance(input.acceptedTermsVersion)
+
         guard let rawEmail = identity.email,
               let email = try? InputValidation.email(rawEmail) else {
             throw Abort(.badRequest, reason: "Apple did not provide an email address. Please try again.")
@@ -270,6 +287,8 @@ func authRoutes(_ app: Application) throws {
             appleSubject: identity.subject.value,
             emailVerified: true
         )
+        user.termsVersion = input.acceptedTermsVersion
+        user.termsAcceptedAt = Date()
         do { try await user.save(on: req.db) }
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "That Apple account is already in use.")
