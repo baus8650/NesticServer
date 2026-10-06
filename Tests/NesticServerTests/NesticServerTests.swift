@@ -21,6 +21,21 @@ private struct UserSettingsRequest: Content {
     let remindersJSON: String?
 }
 
+private struct SharedReminderRequest: Content {
+    let subjectID: UUID
+    let trackerID: UUID
+    let cadence: NestReminderCadence
+    let linkedTrackerID: UUID?
+    let delayMinutes: Int
+    let anchorDate: Date
+    let hour: Int
+    let minute: Int
+}
+
+private struct ReminderNotificationRequest: Content {
+    let enabled: Bool
+}
+
 @Suite("API boundaries", .serialized)
 struct NesticServerTests {
     private func withApp(_ test: (Application) async throws -> Void) async throws {
@@ -268,6 +283,19 @@ struct PostgresIntegrationTests {
             let owner: HTTPHeaders = ["Authorization": "Bearer \(tokens[0])"]
             let member: HTTPHeaders = ["Authorization": "Bearer \(tokens[1])"]
             let outsider: HTTPHeaders = ["Authorization": "Bearer \(tokens[2])"]
+            let supportResponse = try await api.sendRequest(.POST, "feedback", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(CreateFeedbackRequest(subject: "Support request", category: "support", message: "Please help with my account."))
+            })
+            #expect(supportResponse.status == .ok)
+            let supportThread = try supportResponse.content.decode(FeedbackThreadResponse.self)
+            #expect(supportThread.category == "support")
+            #expect(supportThread.messages.count == 1)
+            let privateSupport = try await api.sendRequest(.GET, "feedback/\(supportThread.id)", headers: outsider)
+            #expect(privateSupport.status == .forbidden)
+            let supportReply = try await api.sendRequest(.POST, "feedback/\(supportThread.id)/messages", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(FeedbackMessageRequest(message: "Additional details for support."))
+            })
+            #expect(try supportReply.content.decode(FeedbackThreadResponse.self).messages.count == 2)
             let coowner: HTTPHeaders = ["Authorization": "Bearer \(tokens[3])"]
             let nestResponse = try await api.sendRequest(.POST, "nests", headers: owner, beforeRequest: { req async throws in
                 try req.content.encode(["name": "Integration nest"])
@@ -342,6 +370,29 @@ struct PostgresIntegrationTests {
                 try req.content.encode(["role": "member"])
             })
             #expect(changed.status == .ok)
+            let reminderResponse = try await api.sendRequest(.POST, "nests/\(nest.id)/reminders", headers: owner, beforeRequest: { req async throws in
+                try req.content.encode(SharedReminderRequest(
+                    subjectID: entity.id, trackerID: action.id, cadence: .everyOtherDay,
+                    linkedTrackerID: nil, delayMinutes: 0, anchorDate: Date(), hour: 9, minute: 0
+                ))
+            })
+            #expect(reminderResponse.status == .ok)
+            let sharedReminder = try reminderResponse.content.decode(NestReminderResponse.self)
+            #expect(sharedReminder.notificationsEnabled)
+            let memberReminders = try await api.sendRequest(.GET, "nests/\(nest.id)/reminders", headers: member)
+            let memberSchedules = try memberReminders.content.decode([NestReminderResponse].self)
+            #expect(memberSchedules.contains { $0.id == sharedReminder.id && $0.notificationsEnabled })
+            let muted = try await api.sendRequest(.PUT, "nests/\(nest.id)/reminders/\(sharedReminder.id)/notification", headers: member, beforeRequest: { req async throws in
+                try req.content.encode(ReminderNotificationRequest(enabled: false))
+            })
+            #expect(muted.status == .ok)
+            let mutedReminder = try muted.content.decode(NestReminderResponse.self)
+            #expect(!mutedReminder.notificationsEnabled)
+            let ownerReminders = try await api.sendRequest(.GET, "nests/\(nest.id)/reminders", headers: owner)
+            let ownerSchedules = try ownerReminders.content.decode([NestReminderResponse].self)
+            #expect(ownerSchedules.contains {
+                $0.id == sharedReminder.id && $0.notificationsEnabled
+            })
             let created = try await api.sendRequest(.POST, "entities/\(entity.id)/events", headers: member, beforeRequest: { req async throws in
                 try req.content.encode(BooleanEventRequest(actionID: action.id.uuidString, valueBool: false, note: "Outside"))
             })

@@ -81,7 +81,7 @@ private func feedbackText(_ value: String, field: String) throws -> String {
 
 private func feedbackCategory(_ value: String) throws -> String {
     let clean = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    let allowed = ["idea", "bug", "question", "account", "other"]
+    let allowed = ["idea", "bug", "question", "support", "account", "other"]
     guard allowed.contains(clean) else {
         throw Abort(.badRequest, reason: "Choose a valid feedback category.")
     }

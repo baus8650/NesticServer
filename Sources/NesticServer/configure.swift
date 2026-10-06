@@ -55,6 +55,8 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreateNestMembers())
     app.migrations.add(CreateNestCareLinks())
     app.migrations.add(CreateNestUserSettings())
+    app.migrations.add(CreateNestReminders())
+    app.migrations.add(CreateNestReminderPreferences())
     app.migrations.add(CreateEntities())
     app.migrations.add(CreateTrackableActions())
     app.migrations.add(AddTrackerSymbols())

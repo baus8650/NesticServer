@@ -131,6 +131,42 @@ struct UpdateNestUserSettingsRequest: Content {
     let remindersJSON: String?
 }
 
+struct NestReminderResponse: Content {
+    let id: UUID
+    let nestId: UUID
+    let subjectId: UUID
+    let subjectName: String
+    let trackerId: UUID
+    let trackerName: String
+    let cadence: NestReminderCadence
+    let linkedTrackerId: UUID?
+    let linkedTrackerName: String?
+    let delayMinutes: Int
+    let anchorDate: Date
+    let hour: Int
+    let minute: Int
+    let createdByUserId: UUID
+    let createdByName: String
+    let notificationsEnabled: Bool
+    let createdAt: Date?
+    let updatedAt: Date?
+}
+
+struct NestReminderRequest: Content {
+    let subjectID: UUID
+    let trackerID: UUID
+    let cadence: NestReminderCadence
+    let linkedTrackerID: UUID?
+    let delayMinutes: Int
+    let anchorDate: Date
+    let hour: Int
+    let minute: Int
+}
+
+struct UpdateReminderNotificationRequest: Content {
+    let enabled: Bool
+}
+
 struct EntityResponse: Content {
     let id: UUID
     let nestId: UUID
@@ -463,6 +499,43 @@ private func eventCursorDate(from req: Request) -> Date? {
     return nil
 }
 
+private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool) throws -> NestReminderResponse {
+    NestReminderResponse(
+        id: try reminder.requireID(), nestId: reminder.$nest.id,
+        subjectId: reminder.subjectID, subjectName: reminder.subjectName,
+        trackerId: reminder.trackerID, trackerName: reminder.trackerName,
+        cadence: reminder.cadence, linkedTrackerId: reminder.linkedTrackerID,
+        linkedTrackerName: reminder.linkedTrackerName,
+        delayMinutes: reminder.delayMinutes, anchorDate: reminder.anchorDate,
+        hour: reminder.hour, minute: reminder.minute,
+        createdByUserId: reminder.createdByUserID, createdByName: reminder.createdByName,
+        notificationsEnabled: notificationsEnabled,
+        createdAt: reminder.createdAt, updatedAt: reminder.updatedAt
+    )
+}
+
+private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID, on db: any Database) async throws -> (Entity, TrackableAction, TrackableAction?) {
+    guard (0...23).contains(input.hour), (0...59).contains(input.minute),
+          (0...1_440).contains(input.delayMinutes) else {
+        throw Abort(.badRequest, reason: "Reminder time is invalid")
+    }
+    guard let subject = try await Entity.find(input.subjectID, on: db), subject.$nest.id == nestID else {
+        throw Abort(.badRequest, reason: "Reminder subject is not in this nest")
+    }
+    guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID else {
+        throw Abort(.badRequest, reason: "Reminder tracker is not in this nest")
+    }
+    if input.cadence == .afterMeal {
+        guard let linkedID = input.linkedTrackerID,
+              let linked = try await TrackableAction.find(linkedID, on: db), linked.$nest.id == nestID,
+              linkedID != input.trackerID else {
+            throw Abort(.badRequest, reason: "Choose another tracker that triggers this reminder")
+        }
+        return (subject, tracker, linked)
+    }
+    return (subject, tracker, nil)
+}
+
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
     try authRoutes(app)
@@ -789,6 +862,121 @@ func routes(_ app: Application) throws {
             remindersJSON: settings.remindersJSON,
             updatedAt: settings.updatedAt
         )
+    }
+
+    // MARK: - Shared reminders
+
+    // Reminder schedules are shared with a nest. The enabled state below is
+    // resolved for the requesting member only, so one person can opt out
+    // without muting anyone else.
+    protected.get("nests", ":nestID", "reminders") { req async throws -> [NestReminderResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+        let reminders = try await NestReminder.query(on: req.db)
+            .filter(\.$nest.$id == nestID).sort(\.$createdAt, .ascending).all()
+        let ids = try reminders.map { try $0.requireID() }
+        let preferences = try await NestReminderPreference.query(on: req.db)
+            .filter(\.$user.$id == session.userId).filter(\.$reminder.$id ~~ ids).all()
+        let enabledByID = Dictionary(uniqueKeysWithValues: preferences.map { ($0.$reminder.id, $0.enabled) })
+        return try reminders.map { try nestReminderResponse($0, notificationsEnabled: enabledByID[try $0.requireID()] ?? true) }
+    }
+
+    protected.post("nests", ":nestID", "reminders") { req async throws -> NestReminderResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first(), membership.role != .viewer else {
+            throw Abort(.forbidden, reason: "A member with logging access is required")
+        }
+        let input = try req.content.decode(NestReminderRequest.self)
+        let (subject, tracker, linkedTracker) = try await validateReminderRequest(input, nestID: nestID, on: req.db)
+        let user = try await User.find(session.userId, on: req.db)
+        let creatorName = user?.displayName ?? user?.email ?? "Nest member"
+        let reminder = NestReminder(nestID: nestID, subjectID: try subject.requireID(), subjectName: subject.name,
+                                    trackerID: try tracker.requireID(), trackerName: tracker.name,
+                                    cadence: input.cadence, linkedTrackerID: linkedTracker.flatMap { try? $0.requireID() },
+                                    linkedTrackerName: linkedTracker?.name, delayMinutes: input.delayMinutes,
+                                    anchorDate: input.anchorDate, hour: input.hour, minute: input.minute,
+                                    createdByUserID: session.userId, createdByName: creatorName)
+        try await reminder.save(on: req.db)
+        let response = try nestReminderResponse(reminder, notificationsEnabled: true)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.created", data: response)
+        return response
+    }
+
+    protected.patch("nests", ":nestID", "reminders", ":reminderID") { req async throws -> NestReminderResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let reminderID = try req.parameters.require("reminderID", as: UUID.self)
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first(), membership.role != .viewer,
+              let reminder = try await NestReminder.query(on: req.db)
+                .filter(\.$id == reminderID).filter(\.$nest.$id == nestID).first() else {
+            throw Abort(.forbidden, reason: "You cannot edit this reminder")
+        }
+        guard reminder.createdByUserID == session.userId || membership.role == .owner || membership.role == .admin else {
+            throw Abort(.forbidden, reason: "Only the creator, an owner, or an administrator can edit this reminder")
+        }
+        let input = try req.content.decode(NestReminderRequest.self)
+        let (subject, tracker, linkedTracker) = try await validateReminderRequest(input, nestID: nestID, on: req.db)
+        reminder.subjectID = try subject.requireID()
+        reminder.subjectName = subject.name
+        reminder.trackerID = try tracker.requireID()
+        reminder.trackerName = tracker.name
+        reminder.cadence = input.cadence
+        reminder.linkedTrackerID = linkedTracker.flatMap { try? $0.requireID() }
+        reminder.linkedTrackerName = linkedTracker?.name
+        reminder.delayMinutes = input.delayMinutes
+        reminder.anchorDate = input.anchorDate
+        reminder.hour = input.hour
+        reminder.minute = input.minute
+        try await reminder.save(on: req.db)
+        let preference = try await NestReminderPreference.query(on: req.db)
+            .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
+        let response = try nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.updated", data: response)
+        return response
+    }
+
+    protected.delete("nests", ":nestID", "reminders", ":reminderID") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let reminderID = try req.parameters.require("reminderID", as: UUID.self)
+        guard let membership = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first(),
+              let reminder = try await NestReminder.query(on: req.db)
+                .filter(\.$id == reminderID).filter(\.$nest.$id == nestID).first() else {
+            throw Abort(.notFound, reason: "Reminder not found")
+        }
+        guard reminder.createdByUserID == session.userId || membership.role == .owner || membership.role == .admin else {
+            throw Abort(.forbidden, reason: "Only the creator, an owner, or an administrator can delete this reminder")
+        }
+        try await reminder.delete(on: req.db)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.deleted", data: ["id": reminderID.uuidString])
+        return .noContent
+    }
+
+    protected.put("nests", ":nestID", "reminders", ":reminderID", "notification") { req async throws -> NestReminderResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        let reminderID = try req.parameters.require("reminderID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first() != nil,
+              let reminder = try await NestReminder.query(on: req.db)
+                .filter(\.$id == reminderID).filter(\.$nest.$id == nestID).first() else {
+            throw Abort(.notFound, reason: "Reminder not found")
+        }
+        let input = try req.content.decode(UpdateReminderNotificationRequest.self)
+        let preference = try await NestReminderPreference.query(on: req.db)
+            .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
+            ?? NestReminderPreference(reminderID: reminderID, userID: session.userId, enabled: input.enabled)
+        preference.enabled = input.enabled
+        try await preference.save(on: req.db)
+        return try nestReminderResponse(reminder, notificationsEnabled: preference.enabled)
     }
 
     // MARK: - Caregiver-link management
