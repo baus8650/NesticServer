@@ -1267,21 +1267,23 @@ func routes(_ app: Application) throws {
         return response
     }
 
-    // Remove member (owner only)
+    // Remove another member (owner only), or leave a nest yourself. Leaving
+    // gives every non-owner an immediate safety escape route from private
+    // shared content; an owner must first transfer ownership.
     protected.delete("nests", ":nestID", "members", ":userID") { req async throws -> HTTPStatus in
         let session = try req.auth.require(SessionToken.self)
         let nestID = try req.parameters.require("nestID", as: UUID.self)
         let targetUserID = try req.parameters.require("userID", as: UUID.self)
 
-        // Must be owner to remove members
+        // An owner can remove another member. Any member can remove themself.
         let isOwner = try await NestMember.query(on: req.db)
             .filter(\.$nest.$id == nestID)
             .filter(\.$user.$id == session.userId)
             .filter(\.$role == .owner)
             .first() != nil
 
-        guard isOwner else {
-            throw Abort(.forbidden, reason: "Owner role required")
+        guard isOwner || targetUserID == session.userId else {
+            throw Abort(.forbidden, reason: "Owner role required to remove another member")
         }
 
         guard let membership = try await NestMember.query(on: req.db)

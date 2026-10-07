@@ -81,7 +81,7 @@ private func feedbackText(_ value: String, field: String) throws -> String {
 
 private func feedbackCategory(_ value: String) throws -> String {
     let clean = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    let allowed = ["idea", "bug", "question", "support", "account", "other"]
+    let allowed = ["idea", "bug", "question", "support", "safety", "account", "other"]
     guard allowed.contains(clean) else {
         throw Abort(.badRequest, reason: "Choose a valid feedback category.")
     }
@@ -169,6 +169,8 @@ func feedbackRoutes(_ app: Application) throws {
         try await thread.save(on: req.db)
         let message = FeedbackMessage(threadID: try thread.requireID(), authorUserID: userID, body: body)
         try await message.save(on: req.db)
+        await notifyAdminsAboutFeedback(on: req, category: category, subject: subject, message: body,
+                                        sender: user, isNewThread: true)
         return try await feedbackResponse(thread, on: req.db)
     }
 
@@ -190,6 +192,10 @@ func feedbackRoutes(_ app: Application) throws {
         if !isNesticAdmin(user) { thread.status = FeedbackStatus.open }
         try await thread.save(on: req.db)
         try await FeedbackMessage(threadID: try thread.requireID(), authorUserID: userID, body: body).save(on: req.db)
+        if !isNesticAdmin(user) {
+            await notifyAdminsAboutFeedback(on: req, category: thread.category, subject: thread.subject,
+                                            message: body, sender: user, isNewThread: false)
+        }
         return try await feedbackResponse(thread, on: req.db)
     }
 
@@ -268,6 +274,22 @@ func feedbackRoutes(_ app: Application) throws {
         try await thread.save(on: req.db)
         try await FeedbackMessage(threadID: try thread.requireID(), authorUserID: try adminUser.requireID(), body: body).save(on: req.db)
         return try await feedbackResponse(thread, on: req.db)
+    }
+}
+
+private func notifyAdminsAboutFeedback(on req: Request, category: String, subject: String,
+                                       message: String, sender: User, isNewThread: Bool) async {
+    do {
+        try await NesticEmailService.sendAdminFeedbackNotification(
+            on: req, category: category, subject: subject, message: message,
+            senderName: sender.displayName, senderEmail: sender.email, isNewThread: isNewThread
+        )
+    } catch {
+        // Reporting must remain available even during a mail-provider outage.
+        req.logger.error("Could not notify administrators about feedback", metadata: [
+            "category": .string(category),
+            "error": .string(String(describing: error))
+        ])
     }
 }
 

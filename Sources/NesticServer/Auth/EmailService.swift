@@ -31,14 +31,68 @@ enum NesticEmailService {
         )
     }
 
+    /// Alerts every configured administrator about a new user-originated
+    /// feedback message. This is deliberately email-based: it works even when
+    /// an administrator is not currently signed in to the app or dashboard.
+    static func sendAdminFeedbackNotification(on req: Request, category: String,
+                                              subject: String, message: String,
+                                              senderName: String, senderEmail: String,
+                                              isNewThread: Bool) async throws {
+        let recipients = Array(nesticAdminEmails()).sorted()
+        guard !recipients.isEmpty else { return }
+
+        let isSafetyReport = category == "safety"
+        let title = isSafetyReport
+            ? "Urgent safety report"
+            : (isNewThread ? "New feedback" : "New feedback reply")
+        let action = isSafetyReport ? "Review safety report" : "Open feedback inbox"
+        let link = webURL()
+        let safeSubject = escape(subject)
+        let safeSender = escape(senderName)
+        let safeEmail = escape(senderEmail)
+        let safeMessage = escape(String(message.prefix(4_000)))
+            .replacingOccurrences(of: "\n", with: "<br>")
+        let emailSubject = String(subject
+            .split(whereSeparator: { $0.isNewline })
+            .joined(separator: " ")
+            .prefix(120))
+        let heading = "\(title) from \(safeSender)"
+        let body = """
+        <strong>Type:</strong> \(escape(category.capitalized))<br><br>
+        <strong>From:</strong> \(safeSender) &lt;\(safeEmail)&gt;<br><br>
+        <strong>Subject:</strong> \(safeSubject)<br><br>
+        <strong>Message:</strong><br>\(safeMessage)
+        """
+        let text = """
+        \(title)
+
+        Type: \(category)
+        From: \(senderName) <\(senderEmail)>
+        Subject: \(subject)
+
+        \(message)
+
+        Open the Nestic feedback inbox: \(link)
+        """
+        try await send(on: req, to: recipients, subject: "Nestic: \(title) — \(emailSubject)",
+                       html: page(title: heading, greeting: "Hi Nestic admin,", body: body,
+                                  button: action, link: link), text: text)
+    }
+
     private static func send(on req: Request, to email: String, subject: String, html: String, text: String) async throws {
+        try await send(on: req, to: [email], subject: subject, html: html, text: text)
+    }
+
+    private static func send(on req: Request, to recipients: [String], subject: String, html: String, text: String) async throws {
         guard let apiKey = Environment.get("RESEND_API_KEY"), !apiKey.isEmpty else {
             throw Abort(.failedDependency, reason: "Email delivery is not configured yet.")
         }
 
+        guard !recipients.isEmpty else { return }
+
         let payload = ResendEmailRequest(
             from: Environment.get("RESEND_FROM") ?? "Nestic <noreply@nestic-app.com>",
-            to: [email], subject: subject, html: html, text: text
+            to: recipients, subject: subject, html: html, text: text
         )
         let response = try await req.application.client.post(URI(string: "https://api.resend.com/emails")) { request in
             request.headers.replaceOrAdd(name: .authorization, value: "Bearer \(apiKey)")

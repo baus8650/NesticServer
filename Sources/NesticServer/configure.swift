@@ -14,10 +14,27 @@ public func configure(_ app: Application) async throws {
     app.passwords.use(.bcrypt)
     app.http.server.configuration.hostname = "0.0.0.0"
     app.http.server.configuration.port = Environment.get("PORT").flatMap(Int.init) ?? 8080
-    // The browser client is hosted separately from the API in production. Vapor's
-    // origin-based configuration mirrors the requesting site without allowing
-    // credentialed wildcard access.
-    app.middleware.use(CORSMiddleware(configuration: .default()))
+    // The browser client is hosted separately from the API in production. Keep
+    // the allowlist explicit: `www` and apex are different browser origins.
+    // This middleware must run before auth so even a 401 carries CORS headers.
+    let defaultWebOrigins = [
+        "https://nestic-app.com",
+        "https://www.nestic-app.com",
+        "http://localhost:15433",
+        "http://127.0.0.1:15433"
+    ]
+    let configuredWebOrigins = Environment.get("CORS_ALLOWED_ORIGINS")?
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    let allowedWebOrigins = configuredWebOrigins?.isEmpty == false
+        ? configuredWebOrigins!
+        : defaultWebOrigins
+    app.middleware.use(CORSMiddleware(configuration: .init(
+        allowedOrigin: .any(allowedWebOrigins),
+        allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
+        allowedHeaders: [.accept, .authorization, .contentType, .origin, .xRequestedWith]
+    )))
     // Subject avatars are compressed on-device before their binary upload to R2.
     app.routes.defaultMaxBodySize = "2mb"
 
