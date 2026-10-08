@@ -131,6 +131,49 @@ struct UpdateNestUserSettingsRequest: Content {
     let remindersJSON: String?
 }
 
+/// A nest-scoped forecast shared by every member. The server stores the
+/// calculated result, while the private learning ledger remains on-device.
+struct NestForecastResponse: Content {
+    let id: UUID
+    let nestId: UUID
+    let subjectId: UUID
+    let trackerId: UUID
+    let predictedAt: Date
+    let baselinePredictedAt: Date
+    let contextualPredictedAt: Date?
+    let model: String
+    let intervalHours: Double
+    let confidence: Double
+    let sampleCount: Int
+    let validationSampleCount: Int
+    let expectedErrorHours: Double?
+    let predictionWindowHours: Double
+    let targetNames: [String]
+    let inputNames: [String]
+    let lastEventAt: Date
+    let computedAt: Date
+    let updatedAt: Date?
+}
+
+struct UpsertNestForecastRequest: Content {
+    let subjectId: UUID
+    let trackerId: UUID
+    let predictedAt: Date
+    let baselinePredictedAt: Date
+    let contextualPredictedAt: Date?
+    let model: String
+    let intervalHours: Double
+    let confidence: Double
+    let sampleCount: Int
+    let validationSampleCount: Int
+    let expectedErrorHours: Double?
+    let predictionWindowHours: Double
+    let targetNames: [String]
+    let inputNames: [String]
+    let lastEventAt: Date
+    let computedAt: Date
+}
+
 struct NestReminderResponse: Content {
     let id: UUID
     let nestId: UUID
@@ -536,6 +579,41 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
     return (subject, tracker, nil)
 }
 
+private func encodedForecastNames(_ names: [String]) throws -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return String(decoding: try encoder.encode(Array(names.prefix(100))), as: UTF8.self)
+}
+
+private func decodedForecastNames(_ value: String?) -> [String] {
+    guard let value, let data = value.data(using: .utf8),
+          let names = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+    return names
+}
+
+private func forecastResponse(_ forecast: NestForecast) throws -> NestForecastResponse {
+    NestForecastResponse(
+        id: try forecast.requireID(),
+        nestId: forecast.$nest.id,
+        subjectId: forecast.$entity.id,
+        trackerId: forecast.$action.id,
+        predictedAt: forecast.predictedAt,
+        baselinePredictedAt: forecast.baselinePredictedAt,
+        contextualPredictedAt: forecast.contextualPredictedAt,
+        model: forecast.model,
+        intervalHours: forecast.intervalHours,
+        confidence: forecast.confidence,
+        sampleCount: forecast.sampleCount,
+        validationSampleCount: forecast.validationSampleCount,
+        expectedErrorHours: forecast.expectedErrorHours,
+        predictionWindowHours: forecast.predictionWindowHours,
+        targetNames: decodedForecastNames(forecast.targetNamesJSON),
+        inputNames: decodedForecastNames(forecast.inputNamesJSON),
+        lastEventAt: forecast.lastEventAt,
+        computedAt: forecast.computedAt,
+        updatedAt: forecast.updatedAt)
+}
+
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
     try authRoutes(app)
@@ -862,6 +940,132 @@ func routes(_ app: Application) throws {
             remindersJSON: settings.remindersJSON,
             updatedAt: settings.updatedAt
         )
+    }
+
+    // Forecast output is deliberately nest-scoped. A member's device may
+    // calculate it, but every member reads the same latest result here.
+    protected.get("nests", ":nestID", "forecasts") { req async throws -> [NestForecastResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+
+        let forecasts = try await NestForecast.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .sort(\.$computedAt, .descending)
+            .all()
+        return try forecasts.map(forecastResponse)
+    }
+
+    protected.put("nests", ":nestID", "forecasts") { req async throws -> [NestForecastResponse] in
+        let session = try req.auth.require(SessionToken.self)
+        let nestID = try req.parameters.require("nestID", as: UUID.self)
+        guard try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .first() != nil else {
+            throw Abort(.forbidden, reason: "Not a member of this nest")
+        }
+
+        let input = try req.content.decode([UpsertNestForecastRequest].self)
+        guard input.count <= 100 else {
+            throw Abort(.badRequest, reason: "A nest can publish at most 100 forecasts at once")
+        }
+
+        // Remove results whose source event was edited, excluded, or deleted.
+        // This also lets a new forecast move backward to the now-current last
+        // event after someone deletes the event that used to anchor it.
+        let storedForecasts = try await NestForecast.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .all()
+        for forecast in storedForecasts {
+            let latestIncludedEvent = try await ActionEvent.query(on: req.db)
+                .filter(\.$entity.$id == forecast.$entity.id)
+                .filter(\.$action.$id == forecast.$action.id)
+                .sort(\.$occurredAt, .descending)
+                .all()
+                .first(where: { $0.includeInPredictions })
+            if latestIncludedEvent?.occurredAt != forecast.lastEventAt {
+                try await forecast.delete(on: req.db)
+            }
+        }
+
+        for item in input {
+            guard item.model == "baseline" || item.model == "contextual",
+                  item.intervalHours.isFinite, item.intervalHours > 0, item.intervalHours <= 72,
+                  item.confidence.isFinite, item.confidence >= 0, item.confidence <= 1,
+                  item.sampleCount >= 0, item.sampleCount <= 10_000,
+                  item.validationSampleCount >= 0, item.validationSampleCount <= 10_000,
+                  item.predictionWindowHours.isFinite, item.predictionWindowHours >= 0,
+                  item.predictedAt >= item.lastEventAt,
+                  item.computedAt <= Date().addingTimeInterval(5 * 60) else {
+                throw Abort(.badRequest, reason: "That forecast payload is invalid")
+            }
+
+            guard let entity = try await Entity.find(item.subjectId, on: req.db),
+                  entity.$nest.id == nestID,
+                  let action = try await TrackableAction.find(item.trackerId, on: req.db),
+                  action.$nest.id == nestID else {
+                throw Abort(.badRequest, reason: "The forecast subject or tracker is not in this nest")
+            }
+
+            let existing = try await NestForecast.query(on: req.db)
+                .filter(\.$nest.$id == nestID)
+                .filter(\.$entity.$id == item.subjectId)
+                .filter(\.$action.$id == item.trackerId)
+                .first()
+            // A delayed device must not replace a forecast based on newer
+            // shared activity. Equal-history writes use the most recent
+            // calculation so the nest converges on one payload.
+            if let existing,
+               item.lastEventAt < existing.lastEventAt ||
+               (item.lastEventAt == existing.lastEventAt && item.computedAt <= existing.computedAt) {
+                continue
+            }
+
+            let targetNamesJSON = try encodedForecastNames(item.targetNames)
+            let inputNamesJSON = try encodedForecastNames(item.inputNames)
+            let forecast = existing ?? NestForecast(
+                nestID: nestID, entityID: item.subjectId, actionID: item.trackerId,
+                generatedByUserID: session.userId, predictedAt: item.predictedAt,
+                baselinePredictedAt: item.baselinePredictedAt,
+                contextualPredictedAt: item.contextualPredictedAt, model: item.model,
+                intervalHours: item.intervalHours, confidence: item.confidence,
+                sampleCount: item.sampleCount, validationSampleCount: item.validationSampleCount,
+                expectedErrorHours: item.expectedErrorHours,
+                predictionWindowHours: item.predictionWindowHours,
+                targetNamesJSON: targetNamesJSON,
+                inputNamesJSON: inputNamesJSON,
+                lastEventAt: item.lastEventAt, computedAt: item.computedAt)
+            forecast.$generatedByUser.id = session.userId
+            forecast.predictedAt = item.predictedAt
+            forecast.baselinePredictedAt = item.baselinePredictedAt
+            forecast.contextualPredictedAt = item.contextualPredictedAt
+            forecast.model = item.model
+            forecast.intervalHours = item.intervalHours
+            forecast.confidence = item.confidence
+            forecast.sampleCount = item.sampleCount
+            forecast.validationSampleCount = item.validationSampleCount
+            forecast.expectedErrorHours = item.expectedErrorHours
+            forecast.predictionWindowHours = item.predictionWindowHours
+            forecast.targetNamesJSON = targetNamesJSON
+            forecast.inputNamesJSON = inputNamesJSON
+            forecast.lastEventAt = item.lastEventAt
+            forecast.computedAt = item.computedAt
+            try await forecast.save(on: req.db)
+        }
+
+        let forecasts = try await NestForecast.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .sort(\.$computedAt, .descending)
+            .all()
+        let response = try forecasts.map(forecastResponse)
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "forecast.updated", data: response)
+        return response
     }
 
     // MARK: - Shared reminders

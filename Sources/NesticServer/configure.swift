@@ -80,6 +80,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddTrackerColors())
     app.migrations.add(AddTrackerGroups())
     app.migrations.add(CreateActionEvents())
+    app.migrations.add(CreateNestForecasts())
     app.migrations.add(AddActionEventMetadata())
     app.migrations.add(AddActionEventPhoto())
     app.migrations.add(AddActionEventHealth())

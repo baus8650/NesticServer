@@ -128,6 +128,7 @@ All protected endpoints require `Authorization: Bearer <token>`. JSON dates are 
 | `PATCH /actions/:id`, `DELETE /actions/:id` | Edit tracker metadata or remove a tracker, its quick-action pins, and its history |
 | `GET /entities/:id/pinned-actions`, `PUT /entities/:id/pinned-actions` | Read; replace pins with `{actionIds:[UUID]}` |
 | `GET /nests/:id/entities/summary` | Subjects, ordered pinned actions, and latest value for each |
+| `GET /nests/:id/forecasts`, `PUT /nests/:id/forecasts` | Read or publish the latest shared forecast payloads for the nest; each item is keyed by `{subjectId,trackerId}` and includes its predicted time, confidence, and source event time |
 | `POST /nests/:id/actions` | Create a tracker with optional `{name,valueType,unit,symbol,color,groupName,description}` |
 | `POST /entities/:id/events` | Log `{actionID,occurredAt?,valueNumber?,valueText?,valueBool?,valueJSON?,note?,wasAccident?,includeInPredictions?}` |
 | `GET /nests/:id/events?limit=200&before=<ISO date>` | Shared feed page, newest first; use `before` for older updates |
@@ -148,7 +149,7 @@ Connect to `wss://<server>/ws` with the same Bearer header (legacy `?token=` als
 {"type":"subscribe","nestId":"YOUR-NEST-UUID"}
 ```
 
-The server checks membership and acknowledges with `ws.subscribed`. A connection subscribes to one nest at a time. Updates use `{v:1,type,nestId,ts,data}` with events including `actionEvent.created`, `event.deleted`, `entity.created`, `entity.updated`, `entity.deleted`, `action.created`, `member.created`, `member.updated`, `member.deleted`, and `pinnedActions.updated`. Deleted activity includes `id,nestId,entityId`. Removing a member closes their nest connections; token expiry also closes connections. Reconnect and reload REST data after network interruptions.
+The server checks membership and acknowledges with `ws.subscribed`. A connection subscribes to one nest at a time. Updates use `{v:1,type,nestId,ts,data}` with events including `actionEvent.created`, `event.deleted`, `entity.created`, `entity.updated`, `entity.deleted`, `action.created`, `member.created`, `member.updated`, `member.deleted`, `pinnedActions.updated`, and `forecast.updated`. Deleted activity includes `id,nestId,entityId`. Removing a member closes their nest connections; token expiry also closes connections. Reconnect and reload REST data after network interruptions.
 
 ## Tests
 
