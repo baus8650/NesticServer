@@ -9,7 +9,7 @@ import Vapor
 /// registered when SEED_APP_REVIEW_DATA=true.
 struct SeedAppReviewData: AsyncMigration {
     private static let email = "test@test.com"
-    private static let nestName = "App Review Nest"
+    private static let nestName = "Our Little Nest"
 
     func prepare(on db: any Database) async throws {
         guard let password = Environment.get("APP_REVIEW_SEED_PASSWORD"), !password.isEmpty else {
@@ -64,15 +64,16 @@ struct SeedAppReviewData: AsyncMigration {
             .filter(\.$user.$id == userID)
             .all()
         for membership in memberships {
-            guard let nest = try await Nest.find(membership.$nest.id, on: db), nest.name == Self.nestName else { continue }
+            guard let nest = try await Nest.find(membership.$nest.id, on: db),
+                  [Self.nestName, "App Review Nest"].contains(nest.name) else { continue }
             return nest
         }
         return nil
     }
 
     private func seedContent(userID: UUID, nestID: UUID, on db: any Database) async throws {
-        let maple = Entity(nestID: nestID, kind: .pet, name: "Maple", tags: ["companion", "demo"])
-        let jordan = Entity(nestID: nestID, kind: .person, name: "Jordan", tags: ["household", "demo"])
+        let maple = Entity(nestID: nestID, kind: .pet, name: "Parker", tags: ["companion", "demo"])
+        let jordan = Entity(nestID: nestID, kind: .person, name: "Penny", tags: ["household", "demo"])
         let home = Entity(nestID: nestID, kind: .thing, name: "Home", tags: ["space", "demo"])
         try await maple.save(on: db)
         try await jordan.save(on: db)

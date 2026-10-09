@@ -8,15 +8,15 @@ WITH target AS (
     SELECT DISTINCT u.id AS actor_id, n.id AS nest_id
     FROM users u JOIN nest_members m ON m.user_id = u.id
     JOIN nests n ON n.id = m.nest_id
-    WHERE u.email = 'test@test.com' AND n.name = 'App Review Nest'
+    WHERE u.email = 'test@test.com' AND n.name = 'Our Little Nest'
 ), days AS (
     SELECT d, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York')::date - d AS day
     FROM generate_series(1, 30) d
 ), schedule(subject, tracker, hour, cadence) AS (
-    VALUES ('Maple','Meal',8,1), ('Maple','Outdoor time',9,1),
-           ('Maple','Energy',18,1), ('Maple','Daily supplement',8,3),
-           ('Maple','Weight',10,7), ('Jordan','Mood',20,2),
-           ('Jordan','Water intake',19,2), ('Home','Home check',17,3)
+    VALUES ('Parker','Meal',8,1), ('Parker','Outdoor time',9,1),
+           ('Parker','Energy',18,1), ('Parker','Daily supplement',8,3),
+           ('Parker','Weight',10,7), ('Penny','Mood',20,2),
+           ('Penny','Water intake',19,2), ('Home','Home check',17,3)
 ), candidates AS (
     SELECT t.*, e.id AS entity_id, a.id AS action_id, s.tracker, ds.d, ds.day,
            ((ds.day + make_interval(hours => s.hour,
@@ -63,5 +63,5 @@ JOIN trackable_actions a ON a.id = ev.action_id
 WHERE ev.nest_id IN (
     SELECT n.id FROM nests n JOIN nest_members m ON m.nest_id = n.id
     JOIN users u ON u.id = m.user_id
-    WHERE u.email = 'test@test.com' AND n.name = 'App Review Nest'
+    WHERE u.email = 'test@test.com' AND n.name = 'Our Little Nest'
 ) GROUP BY e.name,a.name ORDER BY e.name,a.name;
