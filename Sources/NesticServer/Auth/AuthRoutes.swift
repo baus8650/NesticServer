@@ -72,19 +72,6 @@ struct UserResponse: Content {
     }
 }
 
-/// Comma-separated account emails can be granted Pro access from the server
-/// environment without changing the app or touching StoreKit transactions.
-/// This is intentionally evaluated on every auth/me response so a Railway
-/// environment-variable change takes effect after the next session refresh.
-private func manuallyUnlockedPro(for user: User) -> Bool {
-    let configured = Environment.get("NESTIC_MANUAL_PRO_EMAILS") ?? ""
-    let emails = configured
-        .split(separator: ",")
-        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        .filter { !$0.isEmpty }
-    return emails.contains(user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-}
-
 struct RegisterRequest: Content {
     let email: String
     let password: String

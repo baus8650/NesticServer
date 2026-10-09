@@ -26,6 +26,15 @@ final class User: Model, Content, @unchecked Sendable {
     @Field(key: "email_verified")
     var emailVerified: Bool
 
+    @OptionalField(key: "manual_pro_override")
+    var manualProOverride: Bool?
+
+    @OptionalField(key: "manual_pro_updated_at")
+    var manualProUpdatedAt: Date?
+
+    @OptionalField(key: "manual_pro_updated_by")
+    var manualProUpdatedBy: UUID?
+
     @OptionalField(key: "apple_subject")
     var appleSubject: String?
 

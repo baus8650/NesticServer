@@ -32,7 +32,7 @@ For App Review, the server includes a separate, neutral fixture that creates `te
 SEED_APP_REVIEW_DATA=true APP_REVIEW_SEED_PASSWORD='set-this-in-Railway' AUTO_MIGRATE=true swift run NesticServer serve
 ```
 
-Set `APP_REVIEW_SEED_PASSWORD` to the password you will give App Review, but do not commit it. After the deployment has started successfully, remove `SEED_APP_REVIEW_DATA` and `APP_REVIEW_SEED_PASSWORD`; the migration record keeps the fixture from being recreated. Add `test@test.com` to `NESTIC_MANUAL_PRO_EMAILS` if the review account should exercise Pro-only screens. The fixture does not overwrite an existing App Review nest that already contains data.
+Set `APP_REVIEW_SEED_PASSWORD` to the password you will give App Review, but do not commit it. After the deployment has started successfully, remove `SEED_APP_REVIEW_DATA` and `APP_REVIEW_SEED_PASSWORD`; the migration record keeps the fixture from being recreated. Grant manual Pro from **Admin dashboard → User accounts → Account access** if the review account should exercise Pro-only screens. Remove it there when the account should use the free plan. The fixture does not overwrite an existing App Review nest that already contains data.
 
 ## Railway preparation
 
@@ -166,3 +166,11 @@ RUN_DATABASE_TESTS=true swift test
 The integration test creates uniquely named test accounts and a nest, tests viewer restrictions, promotion to member, shared logging, isolation from another user, and deletion, then removes its records. It applies migrations but never reverts your database.
 
 If the active command-line developer directory points to an old Xcode, prefix commands with `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer` (or your installed Xcode path).
+
+## Manual Pro access
+
+Nestic administrators can search accounts and grant or remove manual Pro from the iOS admin dashboard or web dashboard’s **View users** screen. Only verified, globally authorized Nestic administrators can call `PATCH /admin/users/:id/pro` with `{"enabled": true}` or `{"enabled": false}`; a nest owner/admin role does not confer this permission. The response contains the updated account and its `manualPro` status.
+
+The `AddManualProAccess` migration stores a nullable per-account decision and the last administrator/time responsible for changing it. An explicit grant or removal overrides `NESTIC_MANUAL_PRO_EMAILS`; accounts without an admin decision continue to use that legacy allowlist. Auth/session refresh returns the effective value to existing app and web clients. Removing manual access does not cancel or override an Apple subscription.
+
+Deploy the server with migrations before releasing the updated clients. The iOS controls remain unavailable when an older server does not return manual access status. No account is granted or revoked by this migration alone.

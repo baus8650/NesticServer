@@ -173,6 +173,15 @@ struct NesticServerTests {
         #expect(try JSONDecoder().decode(RoutineTargets.self, from: singleTarget).values == [first])
     }
 
+    @Test("Manual grants and removals override legacy Pro allowlists")
+    func manualProPrecedence() {
+        let emails: Set<String> = ["allowed@example.com"]
+        #expect(manualProAccess(override: nil, email: " ALLOWED@example.com ", configuredEmails: emails))
+        #expect(!manualProAccess(override: false, email: "allowed@example.com", configuredEmails: emails))
+        #expect(manualProAccess(override: true, email: "other@example.com", configuredEmails: emails))
+        #expect(!manualProAccess(override: nil, email: "other@example.com", configuredEmails: emails))
+    }
+
     @Test("Public profile never serializes a password hash")
     func publicProfile() throws {
         let user = User(email: "person@example.com", passwordHash: "private-hash", displayName: "Alex")
@@ -197,6 +206,89 @@ struct NesticServerTests {
 
 @Suite("Postgres integration", .serialized, .enabled(if: Environment.get("RUN_DATABASE_TESTS") == "true"))
 struct PostgresIntegrationTests {
+    @Test("Only administrators can persistently grant and revoke manual Pro")
+    func manualProManagement() async throws {
+        let app = try await Application.make(.testing)
+        let suffix = UUID().uuidString
+        let admin = User(email: "admin-\(suffix)@example.com", passwordHash: "unused", displayName: "Admin", emailVerified: true)
+        let member = User(email: "member-\(suffix)@example.com", passwordHash: "unused", displayName: "Member", emailVerified: true)
+        let original = Environment.get("NESTIC_ADMIN_EMAILS")
+        let originalPro = Environment.get("NESTIC_MANUAL_PRO_EMAILS")
+        setenv("NESTIC_ADMIN_EMAILS", admin.email, 1)
+        setenv("NESTIC_MANUAL_PRO_EMAILS", member.email, 1)
+        defer {
+            if let original { setenv("NESTIC_ADMIN_EMAILS", original, 1) }
+            else { unsetenv("NESTIC_ADMIN_EMAILS") }
+            if let originalPro { setenv("NESTIC_MANUAL_PRO_EMAILS", originalPro, 1) }
+            else { unsetenv("NESTIC_MANUAL_PRO_EMAILS") }
+        }
+        do {
+            try await configure(app)
+            try await app.autoMigrate()
+            try await admin.save(on: app.db)
+            try await member.save(on: app.db)
+            let adminID = try admin.requireID()
+            let memberID = try member.requireID()
+            let adminToken = try await app.jwt.keys.sign(SessionToken(with: admin))
+            let memberToken = try await app.jwt.keys.sign(SessionToken(with: member))
+            let adminHeaders: HTTPHeaders = ["Authorization": "Bearer \(adminToken)"]
+            let memberHeaders: HTTPHeaders = ["Authorization": "Bearer \(memberToken)"]
+            let path = "admin/users/\(memberID)/pro"
+            try await app.testing().test(.PATCH, path) { response async in
+                #expect(response.status == .unauthorized)
+            }
+            try await app.testing().test(.PATCH, path, headers: memberHeaders, beforeRequest: { req async throws in
+                try req.content.encode(UpdateManualProRequest(enabled: true))
+            }, afterResponse: { response async in
+                #expect(response.status == .forbidden)
+            })
+            #expect(try await User.find(memberID, on: app.db)?.manualProOverride == nil)
+            try await app.testing().test(.PATCH, path, headers: adminHeaders, beforeRequest: { req async throws in
+                try req.content.encode(["other": true])
+            }, afterResponse: { response async in
+                #expect(response.status == .badRequest)
+            })
+            #expect(try await User.find(memberID, on: app.db)?.manualProOverride == nil)
+            try await app.testing().test(.GET, "admin/users?search=" + member.email.uppercased(), headers: adminHeaders) { response async throws in
+                #expect(response.status == .ok)
+                let users = try response.content.decode([AdminUserResponse].self)
+                #expect(users.map(\.id) == [memberID])
+                #expect(users.first?.manualPro == true)
+            }
+            for enabled in [true, false, false] {
+                try await app.testing().test(.PATCH, path, headers: adminHeaders, beforeRequest: { req async throws in
+                    try req.content.encode(UpdateManualProRequest(enabled: enabled))
+                }, afterResponse: { response async throws in
+                    #expect(response.status == .ok)
+                    let result = try response.content.decode(AdminUserResponse.self)
+                    #expect(result.id == memberID)
+                    #expect(result.manualPro == enabled)
+                })
+                let saved = try await User.find(memberID, on: app.db)
+                #expect(saved?.manualProOverride == enabled)
+                #expect(saved?.manualProUpdatedBy == adminID)
+                #expect(saved?.manualProUpdatedAt != nil)
+                try await app.testing().test(.GET, "auth/me", headers: memberHeaders) { response async throws in
+                    #expect(response.status == .ok)
+                    #expect(try response.content.decode(UserResponse.self).manualPro == enabled)
+                }
+            }
+            try await app.testing().test(.PATCH, "admin/users/\(UUID())/pro", headers: adminHeaders, beforeRequest: { req async throws in
+                try req.content.encode(UpdateManualProRequest(enabled: true))
+            }, afterResponse: { response async in
+                #expect(response.status == .notFound)
+            })
+            try await member.delete(on: app.db)
+            try await admin.delete(on: app.db)
+            try await app.asyncShutdown()
+        } catch {
+            if let id = member.id { try? await User.query(on: app.db).filter(\.$id == id).delete() }
+            if let id = admin.id { try? await User.query(on: app.db).filter(\.$id == id).delete() }
+            try await app.asyncShutdown()
+            throw error
+        }
+    }
+
     @Test("Account deletion removes authored shared content and queues every attached photo")
     func accountDeletion() async throws {
         let app = try await Application.make(.testing)

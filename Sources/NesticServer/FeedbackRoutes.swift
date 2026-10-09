@@ -56,6 +56,7 @@ struct AdminUserResponse: Content {
     let emailVerified: Bool
     let createdAt: Date?
     let nestCount: Int
+    let manualPro: Bool
 }
 
 struct AdminDashboardResponse: Content {
@@ -228,14 +229,32 @@ func feedbackRoutes(_ app: Application) throws {
     admin.get("admin", "users") { req async throws -> [AdminUserResponse] in
         _ = try await req.requireNesticAdmin()
         let search = (try? req.query.get(String.self, at: "search"))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let users = try await User.query(on: req.db).sort(\.$createdAt, .descending).range(..<200).all()
-        let filteredUsers = users.filter { user in
-            guard let search, !search.isEmpty else { return true }
-            return user.email.lowercased().contains(search) || user.displayName.lowercased().contains(search)
+        let query = User.query(on: req.db)
+        if let search, !search.isEmpty {
+            // Apply the search before the limit, including older accounts.
+            query.group(.or) { group in
+                group.filter(\.$email, .custom("ILIKE"), "%" + search + "%")
+                    .filter(\.$displayName, .custom("ILIKE"), "%" + search + "%")
+            }
         }
+        let filteredUsers = try await query.sort(\.$createdAt, .descending).range(..<200).all()
         var responses: [AdminUserResponse] = []
         for user in filteredUsers { responses.append(try await adminUserResponse(user, on: req.db)) }
         return responses
+    }
+
+    admin.patch("admin", "users", ":id", "pro") { req async throws -> AdminUserResponse in
+        let adminUser = try await req.requireNesticAdmin()
+        let userID = try req.parameters.require("id", as: UUID.self)
+        let input = try req.content.decode(UpdateManualProRequest.self)
+        guard let user = try await User.find(userID, on: req.db) else {
+            throw Abort(.notFound, reason: "Account not found.")
+        }
+        user.manualProOverride = input.enabled
+        user.manualProUpdatedAt = Date()
+        user.manualProUpdatedBy = try adminUser.requireID()
+        try await user.save(on: req.db)
+        return try await adminUserResponse(user, on: req.db)
     }
 
     admin.get("admin", "feedback") { req async throws -> [FeedbackThreadResponse] in
@@ -298,7 +317,7 @@ private func adminUserResponse(_ user: User, on db: any Database) async throws -
     let nestCount = try await NestMember.query(on: db).filter(\.$user.$id == userID).count()
     return AdminUserResponse(id: userID, email: user.email, displayName: user.displayName,
                              emailVerified: user.emailVerified, createdAt: user.createdAt,
-                             nestCount: nestCount)
+                             nestCount: nestCount, manualPro: manuallyUnlockedPro(for: user))
 }
 
 private struct AdminRouteMiddleware: AsyncMiddleware {
