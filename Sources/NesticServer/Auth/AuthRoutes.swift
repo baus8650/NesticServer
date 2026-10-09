@@ -53,6 +53,7 @@ struct UserResponse: Content {
     let imageURL: String?
     let createdAt: Date?
     let updatedAt: Date?
+    let googleLinked: Bool
     let appleLinked: Bool
     let emailVerified: Bool
     let manualPro: Bool
@@ -65,6 +66,7 @@ struct UserResponse: Content {
         imageURL = user.imageURL
         createdAt = user.createdAt
         updatedAt = user.updatedAt
+        googleLinked = user.googleSubject != nil
         appleLinked = user.appleSubject != nil
         emailVerified = user.emailVerified
         manualPro = manuallyUnlockedPro(for: user)
@@ -191,6 +193,7 @@ private func htmlResponse(title: String, message: String) -> Response {
 }
 
 func authRoutes(_ app: Application) throws {
+    googleAuthRoutes(app)
     app.post("auth", "register") { req async throws -> RegisterResponse in
         try await req.enforceAuthRateLimit(operation: "register")
         let input = try req.content.decode(RegisterRequest.self)

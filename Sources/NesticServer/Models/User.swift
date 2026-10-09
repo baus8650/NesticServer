@@ -38,6 +38,9 @@ final class User: Model, Content, @unchecked Sendable {
     @OptionalField(key: "apple_subject")
     var appleSubject: String?
 
+    @OptionalField(key: "google_subject")
+    var googleSubject: String?
+
     @OptionalField(key: "terms_version")
     var termsVersion: String?
 
