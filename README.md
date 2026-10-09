@@ -22,7 +22,7 @@ docker compose up --build
 
 In the iOS simulator, select `http://localhost:8080` as the API server. On a physical iPhone, use your Mac's LAN IP, such as `http://192.168.1.50:8080`, while on the same Wi-Fi network. For remote family testing, use the HTTPS Railway URL.
 
-Create an account in the app. Password accounts receive a verification email before they can sign in; Apple accounts are verified by Apple. To share a nest, the other person first creates their own account on the same server; an owner or administrator then adds their email from the nest's members screen. Password reset links are delivered by Resend.
+Create an account in the app. Password accounts receive a verification email before they can sign in; Apple and Google accounts are verified by their identity provider. To share a nest, the other person first creates their own account on the same server; an owner or administrator then adds their email from the nest's members screen. Password reset links are delivered by Resend.
 
 Sample database data is opt-in: use `SEED_DEMO_DATA=true swift run NesticServer migrate --yes` in development. That creates the legacy `test@nestic.local` / `password` account. Do not enable it on a hosted service. The app's local demo is independent of this database.
 
@@ -47,6 +47,7 @@ The Dockerfile uses Swift 6.2 to match the locked dependencies. The Dockerfile a
    | `DATABASE_URL` | Reference the PostgreSQL service's `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A randomly generated secret of at least 32 bytes; generate one with `openssl rand -hex 32` |
+   | `GOOGLE_CLIENT_IDS` | Comma-separated Google **web** OAuth client IDs used by Android Credential Manager (public IDs, not secrets) |
    | `APPLE_CLIENT_IDS` | Comma-separated Apple audiences, for example `com.bausch.Nestic-iOS,com.example.nestic.web` |
    | `NESTIC_MANUAL_PRO_EMAILS` | Optional comma-separated account emails to unlock Pro manually for testing/support |
    | `AUTO_MIGRATE` | `true` |
@@ -94,6 +95,7 @@ The API must be public before a TestFlight build can support real accounts and s
    | `DATABASE_URL` | Reference the PostgreSQL service’s `DATABASE_URL` |
    | `DATABASE_TLS_MODE` | `require-unverified` for Railway's private Postgres URL |
    | `JWT_SECRET` | A new random value from `openssl rand -hex 32` |
+   | `GOOGLE_CLIENT_IDS` | Comma-separated Google **web** OAuth client IDs used by Android Credential Manager (public IDs, not secrets) |
    | `APPLE_CLIENT_IDS` | Comma-separated Apple audiences, for example `com.bausch.Nestic-iOS,com.example.nestic.web` |
    | `AUTO_MIGRATE` | `true` |
    | `LOG_LEVEL` | `info` |
@@ -174,3 +176,13 @@ Nestic administrators can search accounts and grant or remove manual Pro from th
 The `AddManualProAccess` migration stores a nullable per-account decision and the last administrator/time responsible for changing it. An explicit grant or removal overrides `NESTIC_MANUAL_PRO_EMAILS`; accounts without an admin decision continue to use that legacy allowlist. Auth/session refresh returns the effective value to existing app and web clients. Removing manual access does not cancel or override an Apple subscription.
 
 Deploy the server with migrations before releasing the updated clients. The iOS controls remain unavailable when an older server does not return manual access status. No account is granted or revoked by this migration alone.
+
+## Android Google sign-in
+
+Set `GOOGLE_CLIENT_IDS` to the web OAuth client ID configured as Android's `GOOGLE_WEB_CLIENT_ID`. No client secret or redirect URI is used. Google Cloud also needs an Android OAuth client for `com.nestic.app` and each installed app signing certificate (debug locally; Play app signing certificate for Play releases). Existing Apple and password sign-in continue to work.
+
+`POST /auth/google/challenge` creates a random five-minute nonce. Pass it into Credential Manager and submit `{identityToken,nonce,acceptedTermsVersion?}` to `POST /auth/google`. New accounts require explicit acceptance of the current Nestic terms; existing Google accounts use the stable Google subject. `POST /auth/google/link` requires a current Nestic bearer session plus a fresh Google proof. Accounts are never merged merely because emails match. `GET /auth/me` adds `googleLinked`.
+
+Google JWT signature, issuer, expiration, audience, verified email, issue time, and nonce are verified on the server. Challenges are stored as SHA-256 hashes and consumed atomically in PostgreSQL, preventing replay across replicas. `AddGoogleIdentity` adds a nullable identity column, unique index, and expiring challenge table; run migrations before serving the new routes (`AUTO_MIGRATE=true` on Railway). Only Google's fixed HTTPS JWKS endpoint is trusted.
+
+`swift test --filter Google` checks identity boundaries without a database. `RUN_DATABASE_TESTS=true swift test --filter Google` additionally checks signup, terms acceptance, repeat login, replay rejection, email collision, and authenticated linking against the configured local test database. Never run integration fixtures against production.

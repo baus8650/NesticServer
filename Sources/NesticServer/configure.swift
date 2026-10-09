@@ -66,6 +66,7 @@ public func configure(_ app: Application) async throws {
 
     app.migrations.add(CreateUsers())
     app.migrations.add(AddAppleIdentity())
+    app.migrations.add(AddGoogleIdentity())
     app.migrations.add(AddEmailVerification())
     app.migrations.add(CreateAuthTokens())
     app.migrations.add(CreateNests())
