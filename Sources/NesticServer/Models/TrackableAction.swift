@@ -27,6 +27,12 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
     @Parent(key: "nest_id")
     var nest: Nest
 
+    @OptionalField(key: "private_owner_id")
+    var privateOwnerId: UUID?
+
+    @OptionalField(key: "allowed_member_ids")
+    var allowedMemberIDs: [UUID]?
+
     @Field(key: "name")
     var name: String  // e.g. "Fed", "Walked", "Weight", "Medication"
 

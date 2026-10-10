@@ -1,4 +1,5 @@
 import Fluent
+import SQLKit
 import Vapor
 import JWT
 import Crypto
@@ -28,6 +29,14 @@ struct WSAck: Content {
 final class RealtimeHub: @unchecked Sendable {
     private let lock = NIOLock()
     private struct Connection { let socket: WebSocket; let userId: UUID }
+    private var privateOwners: [UUID: UUID] = [:]
+    private var privateReaders: [UUID: Set<UUID>] = [:]
+    func rememberPrivateOwners(_ owners: [UUID: UUID], readers: [UUID: Set<UUID>] = [:]) {
+        lock.withLock {
+            privateOwners.merge(owners) { _, new in new }
+            privateReaders.merge(readers) { _, new in new }
+        }
+    }
     private var socketsByNest: [UUID: [ObjectIdentifier: Connection]] = [:]
 
     func add(_ ws: WebSocket, to nestId: UUID, userId: UUID) {
@@ -71,9 +80,9 @@ final class RealtimeHub: @unchecked Sendable {
     }
 
     func broadcast<T: Content>(nestId: UUID, type: String, data: T) {
-        let sockets: [WebSocket] = lock.withLock {
-            Array((socketsByNest[nestId] ?? [:]).values).map(\.socket)
-        }
+        let connections = lock.withLock { Array((socketsByNest[nestId] ?? [:]).values) }
+        let (owners, readers) = lock.withLock { (privateOwners, privateReaders) }
+        let sockets = connections.map(\.socket)
 
         guard !sockets.isEmpty else { return }
 
@@ -84,9 +93,19 @@ final class RealtimeHub: @unchecked Sendable {
             encoder.dateEncodingStrategy = .iso8601
 
             let encoded = try encoder.encode(payload)
-            guard let text = String(data: encoded, encoding: .utf8) else { return }
-
-            for ws in sockets {
+            let json = try JSONSerialization.jsonObject(with: encoded)
+            var currentOwners = owners
+            if let envelope = json as? [String: Any], let object = envelope["data"] as? [String: Any],
+               let idText = object["id"] as? String, let id = UUID(uuidString: idText),
+               let ownerText = object["privateOwnerId"] as? String, let owner = UUID(uuidString: ownerText) {
+                rememberPrivateOwners([id: owner]); currentOwners[id] = owner
+            }
+            for connection in connections {
+                let hidden = Set(currentOwners.filter { id, owner in !(readers[id] ?? [owner]).contains(connection.userId) }.keys)
+                guard let clean = TrackerPrivacyPolicy.filtered(json, hidden: hidden) else { continue }
+                let bytes = try JSONSerialization.data(withJSONObject: clean)
+                guard let text = String(data: bytes, encoding: .utf8) else { continue }
+                let ws = connection.socket
                 ws.eventLoop.execute {
                     ws.send(text)
                 }
@@ -172,6 +191,7 @@ struct UpsertNestForecastRequest: Content {
     let inputNames: [String]
     let lastEventAt: Date
     let computedAt: Date
+    var inputTrackerIDs: [UUID]? = nil
 }
 
 struct NestReminderResponse: Content {
@@ -181,6 +201,8 @@ struct NestReminderResponse: Content {
     let subjectName: String
     let trackerId: UUID
     let trackerName: String
+    let intervalHours: Double?
+    let totalPills: Int?
     let cadence: NestReminderCadence
     let linkedTrackerId: UUID?
     let linkedTrackerName: String?
@@ -190,6 +212,8 @@ struct NestReminderResponse: Content {
     let minute: Int
     let createdByUserId: UUID
     let createdByName: String
+    let lastDoseAt: Date?
+    let pillsTaken: Double?
     let notificationsEnabled: Bool
     let createdAt: Date?
     let updatedAt: Date?
@@ -198,6 +222,8 @@ struct NestReminderResponse: Content {
 struct NestReminderRequest: Content {
     let subjectID: UUID
     let trackerID: UUID
+    let intervalHours: Double?
+    let totalPills: Int?
     let cadence: NestReminderCadence
     let linkedTrackerID: UUID?
     let delayMinutes: Int
@@ -236,6 +262,8 @@ struct TrackableActionResponse: Content {
     let description: String?
     let createdAt: Date?
     let updatedAt: Date?
+    var privateOwnerId: UUID? = nil
+    var allowedMemberIDs: [UUID]? = nil
 }
 
 struct ActionEventResponse: Content {
@@ -364,6 +392,7 @@ struct RoutineResponse: Content {
     let targets: [RoutineTarget]
     let createdAt: Date?
     let updatedAt: Date?
+    var privateOwnerId: UUID? = nil
 }
 
 struct RoutineDeletedResponse: Content {
@@ -469,7 +498,7 @@ private func routineResponse(_ routine: Routine) throws -> RoutineResponse {
     return RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id,
                     entityId: targets[0].entityID, name: routine.name, items: targets[0].items,
                     targets: targets, createdAt: routine.createdAt,
-                    updatedAt: routine.updatedAt)
+                    updatedAt: routine.updatedAt, privateOwnerId: routine.privateOwnerId)
 }
 
 private func routineTargets(_ routine: Routine) -> [RoutineTarget] {
@@ -542,17 +571,30 @@ private func eventCursorDate(from req: Request) -> Date? {
     return nil
 }
 
-private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool) throws -> NestReminderResponse {
-    NestReminderResponse(
+private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool, on db: any Database) async throws -> NestReminderResponse {
+    var lastDoseAt: Date?
+    var pillsTaken: Double?
+    if reminder.cadence == .afterDose {
+        let doses = try await ActionEvent.query(on: db)
+            .filter(\.$nest.$id == reminder.$nest.id)
+            .filter(\.$entity.$id == reminder.subjectID)
+            .filter(\.$action.$id == reminder.trackerID)
+            .filter(\.$occurredAt >= reminder.anchorDate)
+            .filter(\.$occurredAt <= Date()).all()
+        lastDoseAt = doses.filter { $0.valueBool != false && ($0.valueNumber ?? 1) > 0 }.map(\.occurredAt).max()
+        pillsTaken = doses.reduce(0) { $0 + max(0, $1.valueNumber ?? ($1.valueBool == false ? 0 : 1)) }
+    }
+    return NestReminderResponse(
         id: try reminder.requireID(), nestId: reminder.$nest.id,
         subjectId: reminder.subjectID, subjectName: reminder.subjectName,
         trackerId: reminder.trackerID, trackerName: reminder.trackerName,
+        intervalHours: reminder.intervalHours, totalPills: reminder.totalPills,
         cadence: reminder.cadence, linkedTrackerId: reminder.linkedTrackerID,
         linkedTrackerName: reminder.linkedTrackerName,
         delayMinutes: reminder.delayMinutes, anchorDate: reminder.anchorDate,
         hour: reminder.hour, minute: reminder.minute,
         createdByUserId: reminder.createdByUserID, createdByName: reminder.createdByName,
-        notificationsEnabled: notificationsEnabled,
+        lastDoseAt: lastDoseAt, pillsTaken: pillsTaken, notificationsEnabled: notificationsEnabled,
         createdAt: reminder.createdAt, updatedAt: reminder.updatedAt
     )
 }
@@ -567,6 +609,15 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
     }
     guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID else {
         throw Abort(.badRequest, reason: "Reminder tracker is not in this nest")
+    }
+    if input.cadence == .afterDose {
+        guard let hours = input.intervalHours, hours.isFinite, hours >= 0.25, hours <= 720,
+              input.totalPills == nil || (1...100_000).contains(input.totalPills!) else {
+            throw Abort(.badRequest, reason: "Choose an interval from 0.25 to 720 hours and a positive pill total.")
+        }
+        guard tracker.valueType == .none || tracker.valueType == .number || tracker.valueType == .boolean else {
+            throw Abort(.badRequest, reason: "Dose reminders require a simple update, pill count, or yes/no tracker.")
+        }
     }
     if input.cadence == .afterMeal {
         guard let linkedID = input.linkedTrackerID,
@@ -615,7 +666,8 @@ private func forecastResponse(_ forecast: NestForecast) throws -> NestForecastRe
 }
 
 func routes(_ app: Application) throws {
-    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
+    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware(), TrackerPrivacyMiddleware())
+    protected.get("capabilities") { _ in ["privateTrackers": true, "privateRoutines": true, "privateForecasts": true, "selectedTrackerMembers": true] }
     try authRoutes(app)
     registerPhotoRoutes(protected)
 
@@ -636,7 +688,7 @@ func routes(_ app: Application) throws {
     // These routes intentionally do not use the normal session middleware.
     // The unguessable, hashed bearer token is the session, and every request
     // re-checks its expiration, revocation state, and entity/tracker scope.
-    app.get("care-links", ":token") { req async throws -> CareLinkSnapshotResponse in
+    app.grouped(TrackerPrivacyMiddleware()).get("care-links", ":token") { req async throws -> CareLinkSnapshotResponse in
         let link = try await activeCareLink(from: req)
         guard let nest = try await Nest.find(link.$nest.id, on: req.db) else {
             throw Abort(.notFound, reason: "Nest not found")
@@ -668,7 +720,7 @@ func routes(_ app: Application) throws {
                                     unit: action.unit, symbol: action.symbol,
                                     color: action.color, groupName: action.groupName,
                                     description: action.description,
-                                    createdAt: action.createdAt, updatedAt: action.updatedAt)
+                                    createdAt: action.createdAt, updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
         }
 
         let routines = try await Routine.query(on: req.db)
@@ -705,7 +757,7 @@ func routes(_ app: Application) throws {
         )
     }
 
-    app.post("care-links", ":token", "events") { req async throws -> ActionEventResponse in
+    app.grouped(TrackerPrivacyMiddleware()).post("care-links", ":token", "events") { req async throws -> ActionEventResponse in
         let link = try await activeCareLink(from: req)
         guard link.canLog else {
             throw Abort(.forbidden, reason: "This caregiver link is view-only.")
@@ -742,7 +794,7 @@ func routes(_ app: Application) throws {
         return response
     }
 
-    app.post("care-links", ":token", "routines", ":routineID", "log") { req async throws -> [ActionEventResponse] in
+    app.grouped(TrackerPrivacyMiddleware()).post("care-links", ":token", "routines", ":routineID", "log") { req async throws -> [ActionEventResponse] in
         let link = try await activeCareLink(from: req)
         guard link.canLog else {
             throw Abort(.forbidden, reason: "This caregiver link is view-only.")
@@ -982,7 +1034,8 @@ func routes(_ app: Application) throws {
         let storedForecasts = try await NestForecast.query(on: req.db)
             .filter(\.$nest.$id == nestID)
             .all()
-        for forecast in storedForecasts {
+        let hiddenForecastTrackers = try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId)
+        for forecast in storedForecasts where !hiddenForecastTrackers.contains(forecast.$action.id) {
             let latestIncludedEvent = try await ActionEvent.query(on: req.db)
                 .filter(\.$entity.$id == forecast.$entity.id)
                 .filter(\.$action.$id == forecast.$action.id)
@@ -1027,8 +1080,21 @@ func routes(_ app: Application) throws {
                 continue
             }
 
-            let targetNamesJSON = try encodedForecastNames(item.targetNames)
-            let inputNamesJSON = try encodedForecastNames(item.inputNames)
+            let targetNamesJSON = try encodedForecastNames([action.name])
+            let candidateInputs = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).all()
+            let audience: Set<UUID>? = action.privateOwnerId.map { Set(action.allowedMemberIDs ?? []).union([$0]) }
+            let safeSources = candidateInputs.filter { source in
+                guard let owner = source.privateOwnerId else { return true }
+                guard let audience else { return false }
+                return audience.isSubset(of: Set(source.allowedMemberIDs ?? []).union([owner]))
+            }
+            let safeNames = Set(safeSources.map(\.name))
+            let inputIDs = item.inputTrackerIDs.map(Set.init)
+            let namedSources = candidateInputs.filter { inputIDs?.contains($0.id ?? UUID()) == true }
+            let provenInputs = inputIDs.map { $0.isSubset(of: Set(safeSources.compactMap(\.id))) && Set(item.inputNames).isSubset(of: Set(namedSources.map(\.name))) } ?? false
+            let needsInputProof = action.privateOwnerId == nil || !(action.allowedMemberIDs ?? []).isEmpty
+            let useSafeBaseline = needsInputProof && !provenInputs
+            let inputNamesJSON = try encodedForecastNames(item.inputNames.filter { safeNames.contains($0) })
             let forecast = existing ?? NestForecast(
                 nestID: nestID, entityID: item.subjectId, actionID: item.trackerId,
                 generatedByUserID: session.userId, predictedAt: item.predictedAt,
@@ -1056,6 +1122,24 @@ func routes(_ app: Application) throws {
             forecast.inputNamesJSON = inputNamesJSON
             forecast.lastEventAt = item.lastEventAt
             forecast.computedAt = item.computedAt
+            if useSafeBaseline {
+                // Legacy clients cannot attest to their learning inputs. Derive a
+                // baseline strictly from this target's authorized event history.
+                let events = try await ActionEvent.query(on: req.db).filter(\.$entity.$id == item.subjectId)
+                    .filter(\.$action.$id == item.trackerId).filter(\.$includeInPredictions == true)
+                    .filter(\.$wasAccident == false).sort(\.$occurredAt, .descending).limit(31).all()
+                let dates = events.map(\.occurredAt).sorted()
+                let intervals = zip(dates, dates.dropFirst()).map { $1.timeIntervalSince($0) / 3600 }.filter { $0 > 0 }
+                guard let last = dates.last, !intervals.isEmpty else { continue }
+                let interval = min(72, max(0.25, intervals.reduce(0, +) / Double(intervals.count)))
+                let date = last.addingTimeInterval(interval * 3600)
+                forecast.predictedAt = date; forecast.baselinePredictedAt = date
+                forecast.contextualPredictedAt = nil; forecast.model = "baseline"
+                forecast.intervalHours = interval; forecast.confidence = 0.5
+                forecast.sampleCount = intervals.count; forecast.validationSampleCount = 0
+                forecast.expectedErrorHours = nil; forecast.predictionWindowHours = 0
+                forecast.inputNamesJSON = "[]"; forecast.lastEventAt = last
+            }
             try await forecast.save(on: req.db)
         }
 
@@ -1086,7 +1170,11 @@ func routes(_ app: Application) throws {
         let preferences = try await NestReminderPreference.query(on: req.db)
             .filter(\.$user.$id == session.userId).filter(\.$reminder.$id ~~ ids).all()
         let enabledByID = Dictionary(uniqueKeysWithValues: preferences.map { ($0.$reminder.id, $0.enabled) })
-        return try reminders.map { try nestReminderResponse($0, notificationsEnabled: enabledByID[try $0.requireID()] ?? true) }
+        var responses: [NestReminderResponse] = []
+        for reminder in reminders {
+            responses.append(try await nestReminderResponse(reminder, notificationsEnabled: enabledByID[try reminder.requireID()] ?? true, on: req.db))
+        }
+        return responses
     }
 
     protected.post("nests", ":nestID", "reminders") { req async throws -> NestReminderResponse in
@@ -1106,8 +1194,10 @@ func routes(_ app: Application) throws {
                                     linkedTrackerName: linkedTracker?.name, delayMinutes: input.delayMinutes,
                                     anchorDate: input.anchorDate, hour: input.hour, minute: input.minute,
                                     createdByUserID: session.userId, createdByName: creatorName)
+        reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
+        reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)
-        let response = try nestReminderResponse(reminder, notificationsEnabled: true)
+        let response = try await nestReminderResponse(reminder, notificationsEnabled: true, on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.created", data: response)
         return response
     }
@@ -1127,6 +1217,14 @@ func routes(_ app: Application) throws {
         }
         let input = try req.content.decode(NestReminderRequest.self)
         let (subject, tracker, linkedTracker) = try await validateReminderRequest(input, nestID: nestID, on: req.db)
+        let oldTracker = try await TrackableAction.find(reminder.trackerID, on: req.db)
+        let oldLinked: TrackableAction?
+        if let linkedID = reminder.linkedTrackerID { oldLinked = try await TrackableAction.find(linkedID, on: req.db) } else { oldLinked = nil }
+        let oldOwner = oldTracker?.privateOwnerId ?? oldLinked?.privateOwnerId
+        let newOwner = tracker.privateOwnerId ?? linkedTracker?.privateOwnerId
+        guard oldOwner == newOwner else {
+            throw Abort(.badRequest, reason: "Create a new reminder to change between shared and private visibility.")
+        }
         reminder.subjectID = try subject.requireID()
         reminder.subjectName = subject.name
         reminder.trackerID = try tracker.requireID()
@@ -1138,10 +1236,12 @@ func routes(_ app: Application) throws {
         reminder.anchorDate = input.anchorDate
         reminder.hour = input.hour
         reminder.minute = input.minute
+        reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
+        reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)
         let preference = try await NestReminderPreference.query(on: req.db)
             .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
-        let response = try nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true)
+        let response = try await nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true, on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.updated", data: response)
         return response
     }
@@ -1180,7 +1280,7 @@ func routes(_ app: Application) throws {
             ?? NestReminderPreference(reminderID: reminderID, userID: session.userId, enabled: input.enabled)
         preference.enabled = input.enabled
         try await preference.save(on: req.db)
-        return try nestReminderResponse(reminder, notificationsEnabled: preference.enabled)
+        return try await nestReminderResponse(reminder, notificationsEnabled: preference.enabled, on: req.db)
     }
 
     // MARK: - Caregiver-link management
@@ -1522,6 +1622,11 @@ func routes(_ app: Application) throws {
             for link in links {
                 link.revokedAt = Date()
                 try await link.save(on: tx)
+            }
+            let restricted = try await TrackableAction.query(on: tx).filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil).all()
+            for tracker in restricted where tracker.privateOwnerId == targetUserID || (tracker.allowedMemberIDs ?? []).contains(targetUserID) {
+                tracker.allowedMemberIDs = tracker.privateOwnerId == targetUserID ? [] : (tracker.allowedMemberIDs ?? []).filter { $0 != targetUserID }
+                try await tracker.save(on: tx)
             }
             try await membership.delete(on: tx)
         }
@@ -1934,7 +2039,7 @@ func routes(_ app: Application) throws {
                 groupName: a.groupName,
                 description: a.description,
                 createdAt: a.createdAt,
-                updatedAt: a.updatedAt
+                updatedAt: a.updatedAt, privateOwnerId: a.privateOwnerId
             )
         }
     }
@@ -1947,7 +2052,9 @@ func routes(_ app: Application) throws {
             throw Abort(.notFound, reason: "Nest not found")
         }
 
-        // Must be owner/admin to define actions
+        struct PrivacyInput: Content { let isPrivate: Bool? }
+        let isPrivate = (try req.content.decode(PrivacyInput.self)).isPrivate == true
+        // Shared trackers require management access; private trackers require membership.
         let isOwnerOrAdmin = try await NestMember.query(on: req.db)
             .filter(\.$nest.$id == nestID)
             .filter(\.$user.$id == session.userId)
@@ -1957,7 +2064,8 @@ func routes(_ app: Application) throws {
             }
             .first() != nil
 
-        guard isOwnerOrAdmin else {
+        let membership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard isOwnerOrAdmin || (isPrivate && membership != nil && membership?.role != .viewer) else {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
@@ -1988,6 +2096,7 @@ func routes(_ app: Application) throws {
             description: input.description
         )
 
+        action.privateOwnerId = isPrivate ? session.userId : nil
         do { try await action.save(on: req.db) }
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "A tracker with this name already exists in the nest.")
@@ -2003,7 +2112,7 @@ func routes(_ app: Application) throws {
             groupName: action.groupName,
             description: action.description,
             createdAt: action.createdAt,
-            updatedAt: action.updatedAt
+            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId
         )
 
         req.application.realtimeHub.broadcast(
@@ -2013,6 +2122,36 @@ func routes(_ app: Application) throws {
         )
 
         return response
+    }
+
+    protected.put("actions", ":actionID", "sharing") { req async throws -> TrackableActionResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let id = try req.parameters.require("actionID", as: UUID.self)
+        guard let action = try await TrackableAction.find(id, on: req.db), action.privateOwnerId == session.userId,
+              let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == action.$nest.id)
+                .filter(\.$user.$id == session.userId).first(), member.role != .viewer else {
+            throw Abort(.forbidden, reason: "Only the creator can change sharing for a restricted tracker.")
+        }
+        struct Sharing: Content { let allowedMemberIDs: [UUID] }
+        let input = try req.content.decode(Sharing.self)
+        let members = try await NestMember.query(on: req.db).filter(\.$nest.$id == action.$nest.id).filter(\.$role != .viewer).all()
+        let eligible = Set(members.map { $0.$user.id })
+        let selected = Set(input.allowedMemberIDs).subtracting([session.userId])
+        guard selected.count <= 100, selected.isSubset(of: eligible) else {
+            throw Abort(.badRequest, reason: "Select current nest members who can log updates.")
+        }
+        // Discard forecasts computed for the previous audience before expanding access.
+        try await NestForecast.query(on: req.db).filter(\.$nest.$id == action.$nest.id).delete()
+        action.allowedMemberIDs = Array(selected).sorted { $0.uuidString < $1.uuidString }
+        try await action.save(on: req.db)
+        let policy = try await TrackerPrivacyPolicy.load(on: req.db)
+        req.application.realtimeHub.rememberPrivateOwners(policy.owners, readers: policy.readers)
+        // All members receive a content-free refresh signal, including revoked readers.
+        req.application.realtimeHub.broadcast(nestId: action.$nest.id, type: "permissions.updated", data: [String: String]())
+        return TrackableActionResponse(id: try action.requireID(), nestId: action.$nest.id, name: action.name,
+            valueType: action.valueType, unit: action.unit, symbol: action.symbol, color: action.color,
+            groupName: action.groupName, description: action.description, createdAt: action.createdAt,
+            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
     }
 
     // Edit a tracker. Existing events retain their recorded values; only the tracker metadata changes.
@@ -2031,7 +2170,9 @@ func routes(_ app: Application) throws {
                 q.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else { throw Abort(.forbidden, reason: "Owner or admin role required") }
+        let privateMembership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).filter(\.$role != .viewer).first()
+        let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
+        guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         struct UpdateActionRequest: Content {
             let name: String?
@@ -2061,7 +2202,7 @@ func routes(_ app: Application) throws {
                                                groupName: action.groupName,
                                                description: action.description,
                                                createdAt: action.createdAt,
-                                               updatedAt: action.updatedAt)
+                                               updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)
         return response
     }
@@ -2082,7 +2223,9 @@ func routes(_ app: Application) throws {
                 q.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else { throw Abort(.forbidden, reason: "Owner or admin role required") }
+        let privateMembership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).filter(\.$role != .viewer).first()
+        let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
+        guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         let deleted = ActionDeletedResponse(id: actionID, nestId: nestID)
         let eventPhotoKeys = try await ActionEvent.query(on: req.db)
@@ -2204,16 +2347,24 @@ func routes(_ app: Application) throws {
             throw Abort(.badRequest, reason: "All pinned actions must belong to the entity's nest")
         }
 
-        // Replace pins in a transaction
-        try await req.db.transaction { tx in
-            try await EntityPinnedAction.query(on: tx)
-                .filter(\.$entity.$id == entityID)
-                .delete()
-
-            for (idx, actionID) in input.actionIds.enumerated() {
-                let pin = EntityPinnedAction(entityID: entityID, actionID: actionID, sortOrder: idx)
-                try await pin.save(on: tx)
+        // Serialize changes per subject, retaining every other owner's private pins.
+        let updatedPins = try await req.db.transaction { tx -> [UUID] in
+            if let sql = tx as? any SQLDatabase {
+                try await sql.raw("SELECT id FROM entities WHERE id = \(bind: entityID) FOR UPDATE").run()
             }
+            let otherPrivate = try await TrackableAction.query(on: tx)
+                .filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil)
+                .filter(\.$privateOwnerId != session.userId).all().filter { !($0.allowedMemberIDs ?? []).contains(session.userId) }.compactMap(\.id)
+            let retained = try await EntityPinnedAction.query(on: tx)
+                .filter(\.$entity.$id == entityID).filter(\.$action.$id ~~ otherPrivate)
+                .all().map { $0.$action.id }
+            var seen: Set<UUID> = []
+            let combined = (input.actionIds + retained).filter { seen.insert($0).inserted }
+            try await EntityPinnedAction.query(on: tx).filter(\.$entity.$id == entityID).delete()
+            for (idx, actionID) in combined.enumerated() {
+                try await EntityPinnedAction(entityID: entityID, actionID: actionID, sortOrder: idx).save(on: tx)
+            }
+            return combined
         }
 
         req.application.realtimeHub.broadcast(
@@ -2222,7 +2373,7 @@ func routes(_ app: Application) throws {
             data: PinnedActionsUpdatedResponse(
                 entityId: entityID,
                 nestId: nestID,
-                actionIds: input.actionIds
+                actionIds: updatedPins
             )
         )
 
@@ -2259,9 +2410,6 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
-            throw Abort(.forbidden, reason: "Owner or admin role required")
-        }
 
         struct CreateRoutineRequest: Content {
             let entityID: UUID?
@@ -2280,7 +2428,15 @@ func routes(_ app: Application) throws {
         }
         try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
 
+        let trackerIDs = selectedTargets.flatMap { $0.items.map(\.trackerID) }
+        let actions = try await TrackableAction.query(on: req.db).filter(\.$id ~~ trackerIDs).all()
+        let isPrivate = actions.contains { $0.privateOwnerId != nil }
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (isPrivate && member != nil && member?.role != .viewer) else {
+            throw Abort(.forbidden, reason: "Shared routines require an owner or admin.")
+        }
         let routine = Routine(nestID: nestID, name: try InputValidation.name(input.name), targets: selectedTargets)
+        routine.privateOwnerId = isPrivate ? session.userId : nil
         try await routine.save(on: req.db)
         let response = try routineResponse(routine)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.created", data: response)
@@ -2302,7 +2458,8 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (routine.privateOwnerId == session.userId && member != nil && member?.role != .viewer) else {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
@@ -2321,6 +2478,12 @@ func routes(_ app: Application) throws {
             throw Abort(.badRequest, reason: "Choose at least one entity and tracker for this routine.")
         }
         try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
+        if routine.privateOwnerId == nil {
+            let ids = selectedTargets.flatMap { $0.items.map(\.trackerID) }
+            guard try await TrackableAction.query(on: req.db).filter(\.$id ~~ ids).filter(\.$privateOwnerId != nil).count() == 0 else {
+                throw Abort(.badRequest, reason: "Create a new private routine instead of changing a shared routine's visibility.")
+            }
+        }
         routine.name = try InputValidation.name(input.name)
         routine.$entity.id = selectedTargets[0].entityID
         routine.items = RoutineItems(selectedTargets[0].items)
@@ -2346,7 +2509,8 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (routine.privateOwnerId == session.userId && member != nil && member?.role != .viewer) else {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
@@ -2545,6 +2709,8 @@ func routes(_ app: Application) throws {
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
         }
+        let hiddenActions = Array(try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId))
+        if !hiddenActions.isEmpty { query = query.filter(\.$action.$id !~ hiddenActions) }
         let events = try await query.range(..<limit).all()
 
         return try events.compactMap { e in
@@ -2586,6 +2752,8 @@ func routes(_ app: Application) throws {
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
         }
+        let hiddenActions = Array(try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId))
+        if !hiddenActions.isEmpty { query = query.filter(\.$action.$id !~ hiddenActions) }
         let events = try await query.range(..<limit).all()
         return try events.map { try $0.response() }
     }

@@ -191,6 +191,9 @@ final class Routine: Model, Content, @unchecked Sendable {
     @Parent(key: "entity_id")
     var entity: Entity
 
+    @OptionalField(key: "private_owner_id")
+    var privateOwnerId: UUID?
+
     @Field(key: "name")
     var name: String
 
