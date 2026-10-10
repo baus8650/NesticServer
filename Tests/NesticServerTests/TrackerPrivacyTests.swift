@@ -28,6 +28,7 @@ struct TrackerPrivacyTests {
 }
 
 private struct PrivateTrackerInput: Content { let name: String; let valueType: String; let isPrivate: Bool }
+private struct PrivateRoutineInput: Content { let name: String; let targets: [RoutineTarget] }
 private struct PrivateReferenceInput: Content { let trackerID: UUID }
 private struct PrivateEventInput: Content { let actionID: UUID; let note: String }
 
@@ -70,6 +71,29 @@ struct PrivateTrackerDatabaseTests {
             let eventResponse = try await api.sendRequest(.POST, "entities/\(subjectID)/events", headers: own, beforeRequest: { req async throws in try req.content.encode(PrivateEventInput(actionID: tracker.id, note: "Secret note")) })
             #expect(eventResponse.status == .ok)
             let event = try eventResponse.content.decode(ActionEventResponse.self)
+            let routineInput = PrivateRoutineInput(name: "Secret routine", targets: [RoutineTarget(entityID: subjectID, items: [RoutineItem(trackerID: tracker.id, valueNumber: nil, valueText: nil, valueBool: nil, valueJSON: nil)])])
+            let routineResponse = try await api.sendRequest(.POST, "nests/\(nestID)/routines", headers: own, beforeRequest: { req async throws in try req.content.encode(routineInput) })
+            #expect(routineResponse.status == .ok)
+            let routine = try routineResponse.content.decode(RoutineResponse.self)
+            #expect(routine.privateOwnerId == ownerID)
+            let hiddenRoutines = try await api.sendRequest(.GET, "nests/\(nestID)/routines", headers: other)
+            #expect(!hiddenRoutines.body.string.contains("Secret routine"))
+            for method in [HTTPMethod.POST, .PATCH, .DELETE] {
+                let path = "routines/\(routine.id)" + (method == .POST ? "/log" : "")
+                let blocked = try await api.sendRequest(method, path, headers: other)
+                #expect(blocked.status == .notFound)
+            }
+            let logged = try await api.sendRequest(.POST, "routines/\(routine.id)/log", headers: own, beforeRequest: { req async throws in try req.content.encode([String: String]()) })
+            #expect(logged.status == .ok)
+            let forecastInput = UpsertNestForecastRequest(subjectId: subjectID, trackerId: tracker.id, predictedAt: Date().addingTimeInterval(3600), baselinePredictedAt: Date().addingTimeInterval(3600), contextualPredictedAt: nil, model: "baseline", intervalHours: 1, confidence: 0.8, sampleCount: 2, validationSampleCount: 0, expectedErrorHours: nil, predictionWindowHours: 1, targetNames: ["Secret tracker"], inputNames: [], lastEventAt: event.occurredAt, computedAt: Date())
+            let forecastResponse = try await api.sendRequest(.PUT, "nests/\(nestID)/forecasts", headers: own, beforeRequest: { req async throws in try req.content.encode([forecastInput]) })
+            #expect(forecastResponse.status == .ok)
+            let ownForecasts = try await api.sendRequest(.GET, "nests/\(nestID)/forecasts", headers: own)
+            #expect(try ownForecasts.content.decode([NestForecastResponse].self).contains { $0.trackerId == tracker.id })
+            let hiddenForecasts = try await api.sendRequest(.GET, "nests/\(nestID)/forecasts", headers: other)
+            #expect(!hiddenForecasts.body.string.contains("Secret"))
+            let overwriteForecast = try await api.sendRequest(.PUT, "nests/\(nestID)/forecasts", headers: other, beforeRequest: { req async throws in try req.content.encode([forecastInput]) })
+            #expect(overwriteForecast.status == .notFound)
             let reminder = NestReminder(nestID: nestID, subjectID: subjectID, subjectName: "Person", trackerID: tracker.id, trackerName: "Secret tracker", cadence: .monthly, linkedTrackerID: nil, linkedTrackerName: nil, delayMinutes: 30, anchorDate: Date(), hour: 9, minute: 0, createdByUserID: ownerID, createdByName: "Private owner")
             try await reminder.save(on: app.db)
             for path in ["nests/\(nestID)/actions", "nests/\(nestID)/events", "entities/\(subjectID)/events", "nests/\(nestID)/entities/summary", "nests/\(nestID)/reminders"] {
@@ -97,6 +121,13 @@ struct PrivateTrackerDatabaseTests {
             let sameNamePrivate = try await api.sendRequest(.POST, "nests/\(nestID)/actions", headers: other, beforeRequest: { req async throws in try req.content.encode(PrivateTrackerInput(name: "Secret tracker", valueType: "none", isPrivate: true)) })
             #expect(sameNamePrivate.status == .ok)
             let sharedTracker = try sameNameShared.content.decode(TrackableActionResponse.self)
+            _ = try await api.sendRequest(.PUT, "entities/\(subjectID)/pinned-actions", headers: own, beforeRequest: { req async throws in try req.content.encode(SetPinnedActionsRequest(actionIds: [tracker.id, sharedTracker.id])) })
+            let editedRoutine = try await api.sendRequest(.PATCH, "routines/\(routine.id)", headers: own, beforeRequest: { req async throws in try req.content.encode(PrivateRoutineInput(name: "Still secret", targets: [RoutineTarget(entityID: subjectID, items: [RoutineItem(trackerID: sharedTracker.id, valueNumber: nil, valueText: nil, valueBool: nil, valueJSON: nil)])])) })
+            #expect(editedRoutine.status == .ok)
+            #expect(try editedRoutine.content.decode(RoutineResponse.self).privateOwnerId == ownerID)
+            let stillHidden = try await api.sendRequest(.GET, "nests/\(nestID)/routines", headers: other)
+            #expect(!stillHidden.body.string.contains("Still secret"))
+
             let sharedEvent = ActionEvent(nestID: nestID, entityID: subjectID, actionID: sharedTracker.id, actorUserID: adminID, occurredAt: Date().addingTimeInterval(-60), note: "Shared note")
             try await sharedEvent.save(on: app.db)
             let page = try await api.sendRequest(.GET, "nests/\(nestID)/events?limit=1", headers: other)
