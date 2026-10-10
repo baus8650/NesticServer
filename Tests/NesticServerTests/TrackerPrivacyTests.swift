@@ -15,6 +15,7 @@ struct TrackerPrivacyTests {
         #expect(!text.contains(hidden.uuidString))
         #expect(text.contains("Water"))
         #expect(TrackerPrivacyPolicy.filtered(["type": "event.created", "data": ["actionId": hidden.uuidString, "note": "Secret"]], hidden: [hidden]) == nil)
+        #expect(TrackerPrivacyPolicy.filtered(["type": "forecast.updated", "data": [["trackerId": hidden.uuidString, "targetNames": ["Secret"]]]], hidden: [hidden]) == nil)
         #expect(TrackerPrivacyPolicy.referencedIDs("{\"\(hidden)\":true}").contains(hidden))
     }
     @Test("Only the tracker owner can see dependent events and reminders")
