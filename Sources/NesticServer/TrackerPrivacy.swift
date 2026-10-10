@@ -51,6 +51,7 @@ struct TrackerPrivacyPolicy: Sendable {
             }
             // A realtime envelope whose entire payload is private is not sent.
             if object["data"] != nil && result["data"] == nil { return nil }
+            if let original = object["data"] as? [Any], !original.isEmpty, let visible = result["data"] as? [Any], visible.isEmpty { return nil }
             return result
         }
         return value
