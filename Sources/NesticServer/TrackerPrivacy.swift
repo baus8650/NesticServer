@@ -6,6 +6,7 @@ import Vapor
 struct TrackerPrivacyPolicy: Sendable {
     var owners: [UUID: UUID]
     var trackerOwners: [UUID: UUID]
+    var readers: [UUID: Set<UUID>] = [:]
 
     static func load(on db: any Database, eventID: UUID? = nil) async throws -> TrackerPrivacyPolicy {
         let actions = try await TrackableAction.query(on: db).filter(\.$privateOwnerId != nil).all()
@@ -13,23 +14,41 @@ struct TrackerPrivacyPolicy: Sendable {
             guard let id = action.id, let owner = action.privateOwnerId else { return nil }
             return (id, owner)
         })
+        var readers: [UUID: Set<UUID>] = [:]
+        let memberships = try await NestMember.query(on: db).all()
+        for action in actions {
+            guard let id = action.id, let owner = action.privateOwnerId else { continue }
+            let members = Set(memberships.filter { $0.$nest.id == action.$nest.id }.map { $0.$user.id })
+            readers[id] = Set(action.allowedMemberIDs ?? []).intersection(members).union([owner])
+        }
         var owners = trackerOwners
         if !trackerOwners.isEmpty {
             let ids = Array(trackerOwners.keys)
-            if let eventID, let event = try await ActionEvent.find(eventID, on: db), let owner = trackerOwners[event.$action.id] { owners[eventID] = owner }
+            if let eventID, let event = try await ActionEvent.find(eventID, on: db), let owner = trackerOwners[event.$action.id] { owners[eventID] = owner; readers[eventID] = readers[event.$action.id] }
             let reminders = try await NestReminder.query(on: db).group(.or) { $0.filter(\.$trackerID ~~ ids).filter(\.$linkedTrackerID ~~ ids) }.all()
             for reminder in reminders {
-                if let id = reminder.id { owners[id] = trackerOwners[reminder.trackerID] ?? reminder.linkedTrackerID.flatMap { trackerOwners[$0] } }
+                if let id = reminder.id {
+                    owners[id] = trackerOwners[reminder.trackerID] ?? reminder.linkedTrackerID.flatMap { trackerOwners[$0] }
+                    let audiences = [reminder.trackerID, reminder.linkedTrackerID].compactMap { $0 }.compactMap { readers[$0] }
+                    readers[id] = audiences.reduce(audiences.first ?? []) { $0.intersection($1) }
+                }
             }
         }
         for routine in try await Routine.query(on: db).filter(\.$privateOwnerId != nil).all() {
-            if let id = routine.id, let owner = routine.privateOwnerId { owners[id] = owner }
+            if let id = routine.id, let owner = routine.privateOwnerId {
+                owners[id] = owner
+                let trackerIDs = routine.targets?.values.flatMap { $0.items.map(\.trackerID) } ?? routine.items.values.map(\.trackerID)
+                readers[id] = trackerIDs.compactMap { readers[$0] }.reduce(Set([owner])) { $0.intersection($1) }
+            }
         }
-        return TrackerPrivacyPolicy(owners: owners, trackerOwners: trackerOwners)
+        return TrackerPrivacyPolicy(owners: owners, trackerOwners: trackerOwners, readers: readers)
     }
 
     func hidden(for user: UUID?) -> Set<UUID> {
-        Set(owners.filter { $0.value != user }.keys)
+        Set(owners.filter { id, owner in
+            guard let user else { return true }
+            return !(readers[id] ?? [owner]).contains(user)
+        }.keys)
     }
 
     /// Applies to typed JSON envelopes, collections, nested home summaries,
@@ -37,7 +56,10 @@ struct TrackerPrivacyPolicy: Sendable {
     static func filtered(_ value: Any, hidden: Set<UUID>) -> Any? {
         if let string = value as? String {
             if let id = UUID(uuidString: string), hidden.contains(id) { return nil }
-            if (string.hasPrefix("{") || string.hasPrefix("[")), let data = string.data(using: .utf8), let nested = try? JSONSerialization.jsonObject(with: data), let clean = filtered(nested, hidden: hidden), let encoded = try? JSONSerialization.data(withJSONObject: clean) { return String(decoding: encoded, as: UTF8.self) }
+            if (["{", "["].contains(string.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1).description)), let data = string.data(using: .utf8), let nested = try? JSONSerialization.jsonObject(with: data) {
+                guard let clean = filtered(nested, hidden: hidden), let encoded = try? JSONSerialization.data(withJSONObject: clean, options: [.fragmentsAllowed]) else { return nil }
+                return String(decoding: encoded, as: UTF8.self)
+            }
         }
         if let array = value as? [Any] { return array.compactMap { filtered($0, hidden: hidden) } }
         if let object = value as? [String: Any] {
@@ -60,7 +82,7 @@ struct TrackerPrivacyPolicy: Sendable {
     static func referencedIDs(_ value: Any) -> Set<UUID> {
         if let string = value as? String {
             if let id = UUID(uuidString: string) { return [id] }
-            if (string.hasPrefix("{") || string.hasPrefix("[")), let data = string.data(using: .utf8), let nested = try? JSONSerialization.jsonObject(with: data) { return referencedIDs(nested) }
+            if (["{", "["].contains(string.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1).description)), let data = string.data(using: .utf8), let nested = try? JSONSerialization.jsonObject(with: data) { return referencedIDs(nested) }
             return []
         }
         if let array = value as? [Any] { return array.reduce(into: []) { $0.formUnion(referencedIDs($1)) } }
@@ -78,7 +100,7 @@ struct TrackerPrivacyMiddleware: AsyncMiddleware {
     func respond(to req: Request, chainingTo next: any AsyncResponder) async throws -> Response {
         let user = req.auth.get(SessionToken.self)?.userId
         let policy = try await TrackerPrivacyPolicy.load(on: req.db, eventID: req.parameters.get("eventID").flatMap(UUID.init(uuidString:)))
-        req.application.realtimeHub.rememberPrivateOwners(policy.owners)
+        req.application.realtimeHub.rememberPrivateOwners(policy.owners, readers: policy.readers)
         let hidden = policy.hidden(for: user)
         for key in ["actionID", "eventID", "reminderID", "routineID"] {
             if let raw = req.parameters.get(key), let id = UUID(uuidString: raw), hidden.contains(id) {
@@ -90,8 +112,8 @@ struct TrackerPrivacyMiddleware: AsyncMiddleware {
             let references = TrackerPrivacyPolicy.referencedIDs(json)
             guard references.isDisjoint(with: hidden) else { throw Abort(.notFound, reason: "Resource not found") }
             let sharedPath = ["care-links"].contains { req.url.path.split(separator: "/").contains(Substring($0)) }
-            if sharedPath && !references.isDisjoint(with: Set(policy.trackerOwners.keys)) {
-                throw Abort(.badRequest, reason: "Private trackers cannot be included in caregiver access.")
+            if sharedPath && !references.isDisjoint(with: Set(policy.owners.keys)) {
+                throw Abort(.badRequest, reason: "Restricted resources cannot be included in caregiver access.")
             }
         }
         let response = try await next.respond(to: req)
