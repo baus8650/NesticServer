@@ -194,6 +194,8 @@ struct NestReminderResponse: Content {
     let subjectName: String
     let trackerId: UUID
     let trackerName: String
+    let intervalHours: Double?
+    let totalPills: Int?
     let cadence: NestReminderCadence
     let linkedTrackerId: UUID?
     let linkedTrackerName: String?
@@ -203,6 +205,8 @@ struct NestReminderResponse: Content {
     let minute: Int
     let createdByUserId: UUID
     let createdByName: String
+    let lastDoseAt: Date?
+    let pillsTaken: Double?
     let notificationsEnabled: Bool
     let createdAt: Date?
     let updatedAt: Date?
@@ -211,6 +215,8 @@ struct NestReminderResponse: Content {
 struct NestReminderRequest: Content {
     let subjectID: UUID
     let trackerID: UUID
+    let intervalHours: Double?
+    let totalPills: Int?
     let cadence: NestReminderCadence
     let linkedTrackerID: UUID?
     let delayMinutes: Int
@@ -557,17 +563,30 @@ private func eventCursorDate(from req: Request) -> Date? {
     return nil
 }
 
-private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool) throws -> NestReminderResponse {
-    NestReminderResponse(
+private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool, on db: any Database) async throws -> NestReminderResponse {
+    var lastDoseAt: Date?
+    var pillsTaken: Double?
+    if reminder.cadence == .afterDose {
+        let doses = try await ActionEvent.query(on: db)
+            .filter(\.$nest.$id == reminder.$nest.id)
+            .filter(\.$entity.$id == reminder.subjectID)
+            .filter(\.$action.$id == reminder.trackerID)
+            .filter(\.$occurredAt >= reminder.anchorDate)
+            .filter(\.$occurredAt <= Date()).all()
+        lastDoseAt = doses.filter { $0.valueBool != false && ($0.valueNumber ?? 1) > 0 }.map(\.occurredAt).max()
+        pillsTaken = doses.reduce(0) { $0 + max(0, $1.valueNumber ?? ($1.valueBool == false ? 0 : 1)) }
+    }
+    return NestReminderResponse(
         id: try reminder.requireID(), nestId: reminder.$nest.id,
         subjectId: reminder.subjectID, subjectName: reminder.subjectName,
         trackerId: reminder.trackerID, trackerName: reminder.trackerName,
+        intervalHours: reminder.intervalHours, totalPills: reminder.totalPills,
         cadence: reminder.cadence, linkedTrackerId: reminder.linkedTrackerID,
         linkedTrackerName: reminder.linkedTrackerName,
         delayMinutes: reminder.delayMinutes, anchorDate: reminder.anchorDate,
         hour: reminder.hour, minute: reminder.minute,
         createdByUserId: reminder.createdByUserID, createdByName: reminder.createdByName,
-        notificationsEnabled: notificationsEnabled,
+        lastDoseAt: lastDoseAt, pillsTaken: pillsTaken, notificationsEnabled: notificationsEnabled,
         createdAt: reminder.createdAt, updatedAt: reminder.updatedAt
     )
 }
@@ -582,6 +601,15 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
     }
     guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID else {
         throw Abort(.badRequest, reason: "Reminder tracker is not in this nest")
+    }
+    if input.cadence == .afterDose {
+        guard let hours = input.intervalHours, hours.isFinite, hours >= 0.25, hours <= 720,
+              input.totalPills == nil || (1...100_000).contains(input.totalPills!) else {
+            throw Abort(.badRequest, reason: "Choose an interval from 0.25 to 720 hours and a positive pill total.")
+        }
+        guard tracker.valueType == .none || tracker.valueType == .number || tracker.valueType == .boolean else {
+            throw Abort(.badRequest, reason: "Dose reminders require a simple update, pill count, or yes/no tracker.")
+        }
     }
     if input.cadence == .afterMeal {
         guard let linkedID = input.linkedTrackerID,
@@ -1102,7 +1130,11 @@ func routes(_ app: Application) throws {
         let preferences = try await NestReminderPreference.query(on: req.db)
             .filter(\.$user.$id == session.userId).filter(\.$reminder.$id ~~ ids).all()
         let enabledByID = Dictionary(uniqueKeysWithValues: preferences.map { ($0.$reminder.id, $0.enabled) })
-        return try reminders.map { try nestReminderResponse($0, notificationsEnabled: enabledByID[try $0.requireID()] ?? true) }
+        var responses: [NestReminderResponse] = []
+        for reminder in reminders {
+            responses.append(try await nestReminderResponse(reminder, notificationsEnabled: enabledByID[try reminder.requireID()] ?? true, on: req.db))
+        }
+        return responses
     }
 
     protected.post("nests", ":nestID", "reminders") { req async throws -> NestReminderResponse in
@@ -1122,8 +1154,10 @@ func routes(_ app: Application) throws {
                                     linkedTrackerName: linkedTracker?.name, delayMinutes: input.delayMinutes,
                                     anchorDate: input.anchorDate, hour: input.hour, minute: input.minute,
                                     createdByUserID: session.userId, createdByName: creatorName)
+        reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
+        reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)
-        let response = try nestReminderResponse(reminder, notificationsEnabled: true)
+        let response = try await nestReminderResponse(reminder, notificationsEnabled: true, on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.created", data: response)
         return response
     }
@@ -1162,10 +1196,12 @@ func routes(_ app: Application) throws {
         reminder.anchorDate = input.anchorDate
         reminder.hour = input.hour
         reminder.minute = input.minute
+        reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
+        reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)
         let preference = try await NestReminderPreference.query(on: req.db)
             .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
-        let response = try nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true)
+        let response = try await nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true, on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.updated", data: response)
         return response
     }
@@ -1204,7 +1240,7 @@ func routes(_ app: Application) throws {
             ?? NestReminderPreference(reminderID: reminderID, userID: session.userId, enabled: input.enabled)
         preference.enabled = input.enabled
         try await preference.save(on: req.db)
-        return try nestReminderResponse(reminder, notificationsEnabled: preference.enabled)
+        return try await nestReminderResponse(reminder, notificationsEnabled: preference.enabled, on: req.db)
     }
 
     // MARK: - Caregiver-link management
