@@ -16,7 +16,21 @@ struct TrackerPrivacyTests {
         #expect(text.contains("Water"))
         #expect(TrackerPrivacyPolicy.filtered(["type": "event.created", "data": ["actionId": hidden.uuidString, "note": "Secret"]], hidden: [hidden]) == nil)
         #expect(TrackerPrivacyPolicy.filtered(["type": "forecast.updated", "data": [["trackerId": hidden.uuidString, "targetNames": ["Secret"]]]], hidden: [hidden]) == nil)
+        let embedded = "{\"trackerId\":\"\(hidden)\",\"name\":\"Secret\"}"
+        #expect(TrackerPrivacyPolicy.filtered(embedded, hidden: [hidden]) == nil)
+        #expect(TrackerPrivacyPolicy.filtered(" \n" + embedded, hidden: [hidden]) == nil)
+        #expect(TrackerPrivacyPolicy.referencedIDs(" \n" + embedded).contains(hidden))
+        #expect(TrackerPrivacyPolicy.filtered(["payload": embedded], hidden: [hidden]) as? [String: String] == [:])
         #expect(TrackerPrivacyPolicy.referencedIDs("{\"\(hidden)\":true}").contains(hidden))
+    }
+    @Test("Selected readers are permitted; linked reminders use the intersection")
+    func selectedAudience() {
+        let owner = UUID(), selected = UUID(), excluded = UUID(), tracker = UUID(), linked = UUID(), reminder = UUID()
+        let p = TrackerPrivacyPolicy(owners: [tracker: owner, linked: owner, reminder: owner], trackerOwners: [tracker: owner, linked: owner], readers: [tracker: [owner, selected], linked: [owner], reminder: [owner]])
+        #expect(!p.hidden(for: selected).contains(tracker))
+        #expect(p.hidden(for: selected).contains(reminder))
+        #expect(p.hidden(for: excluded).contains(tracker))
+        #expect(p.hidden(for: nil).contains(tracker))
     }
     @Test("Only the tracker owner can see dependent events and reminders")
     func ownerBoundary() {
