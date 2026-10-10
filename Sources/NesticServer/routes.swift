@@ -378,6 +378,7 @@ struct RoutineResponse: Content {
     let targets: [RoutineTarget]
     let createdAt: Date?
     let updatedAt: Date?
+    var privateOwnerId: UUID? = nil
 }
 
 struct RoutineDeletedResponse: Content {
@@ -483,7 +484,7 @@ private func routineResponse(_ routine: Routine) throws -> RoutineResponse {
     return RoutineResponse(id: try routine.requireID(), nestId: routine.$nest.id,
                     entityId: targets[0].entityID, name: routine.name, items: targets[0].items,
                     targets: targets, createdAt: routine.createdAt,
-                    updatedAt: routine.updatedAt)
+                    updatedAt: routine.updatedAt, privateOwnerId: routine.privateOwnerId)
 }
 
 private func routineTargets(_ routine: Routine) -> [RoutineTarget] {
@@ -630,7 +631,7 @@ private func forecastResponse(_ forecast: NestForecast) throws -> NestForecastRe
 
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware(), TrackerPrivacyMiddleware())
-    protected.get("capabilities") { _ in ["privateTrackers": true] }
+    protected.get("capabilities") { _ in ["privateTrackers": true, "privateRoutines": true, "privateForecasts": true] }
     try authRoutes(app)
     registerPhotoRoutes(protected)
 
@@ -2297,9 +2298,6 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
-            throw Abort(.forbidden, reason: "Owner or admin role required")
-        }
 
         struct CreateRoutineRequest: Content {
             let entityID: UUID?
@@ -2318,7 +2316,15 @@ func routes(_ app: Application) throws {
         }
         try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
 
+        let trackerIDs = selectedTargets.flatMap { $0.items.map(\.trackerID) }
+        let actions = try await TrackableAction.query(on: req.db).filter(\.$id ~~ trackerIDs).all()
+        let isPrivate = actions.contains { $0.privateOwnerId != nil }
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (isPrivate && member != nil && member?.role != .viewer) else {
+            throw Abort(.forbidden, reason: "Shared routines require an owner or admin.")
+        }
         let routine = Routine(nestID: nestID, name: try InputValidation.name(input.name), targets: selectedTargets)
+        routine.privateOwnerId = isPrivate ? session.userId : nil
         try await routine.save(on: req.db)
         let response = try routineResponse(routine)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.created", data: response)
@@ -2340,7 +2346,8 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (routine.privateOwnerId == session.userId && member != nil && member?.role != .viewer) else {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
@@ -2359,6 +2366,12 @@ func routes(_ app: Application) throws {
             throw Abort(.badRequest, reason: "Choose at least one entity and tracker for this routine.")
         }
         try await validateRoutineTargets(selectedTargets, nestID: nestID, on: req.db)
+        if routine.privateOwnerId == nil {
+            let ids = selectedTargets.flatMap { $0.items.map(\.trackerID) }
+            guard try await TrackableAction.query(on: req.db).filter(\.$id ~~ ids).filter(\.$privateOwnerId != nil).count() == 0 else {
+                throw Abort(.badRequest, reason: "Create a new private routine instead of changing a shared routine's visibility.")
+            }
+        }
         routine.name = try InputValidation.name(input.name)
         routine.$entity.id = selectedTargets[0].entityID
         routine.items = RoutineItems(selectedTargets[0].items)
@@ -2384,7 +2397,8 @@ func routes(_ app: Application) throws {
                 query.filter(\.$role == .admin)
             }
             .first() != nil
-        guard canManage else {
+        let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first()
+        guard canManage || (routine.privateOwnerId == session.userId && member != nil && member?.role != .viewer) else {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
