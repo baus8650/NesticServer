@@ -1,4 +1,5 @@
 import Fluent
+import SQLKit
 import Vapor
 import JWT
 import Crypto
@@ -2234,18 +2235,23 @@ func routes(_ app: Application) throws {
             throw Abort(.badRequest, reason: "All pinned actions must belong to the entity's nest")
         }
 
-        let otherPrivate = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil).filter(\.$privateOwnerId != session.userId).all().compactMap(\.id)
-        let retained = try await EntityPinnedAction.query(on: req.db).filter(\.$entity.$id == entityID).filter(\.$action.$id ~~ otherPrivate).all().map { $0.$action.id }
-        // Replace only the caller-visible pins, retaining other owners' private pins.
-        try await req.db.transaction { tx in
-            try await EntityPinnedAction.query(on: tx)
-                .filter(\.$entity.$id == entityID)
-                .delete()
-
-            for (idx, actionID) in (input.actionIds + retained).enumerated() {
-                let pin = EntityPinnedAction(entityID: entityID, actionID: actionID, sortOrder: idx)
-                try await pin.save(on: tx)
+        // Serialize changes per subject, retaining every other owner's private pins.
+        let updatedPins = try await req.db.transaction { tx -> [UUID] in
+            if let sql = tx as? any SQLDatabase {
+                try await sql.raw("SELECT id FROM entities WHERE id = \(bind: entityID) FOR UPDATE").run()
             }
+            let otherPrivate = try await TrackableAction.query(on: tx)
+                .filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil)
+                .filter(\.$privateOwnerId != session.userId).all().compactMap(\.id)
+            let retained = try await EntityPinnedAction.query(on: tx)
+                .filter(\.$entity.$id == entityID).filter(\.$action.$id ~~ otherPrivate)
+                .all().map { $0.$action.id }
+            let combined = input.actionIds + retained
+            try await EntityPinnedAction.query(on: tx).filter(\.$entity.$id == entityID).delete()
+            for (idx, actionID) in combined.enumerated() {
+                try await EntityPinnedAction(entityID: entityID, actionID: actionID, sortOrder: idx).save(on: tx)
+            }
+            return combined
         }
 
         req.application.realtimeHub.broadcast(
@@ -2254,7 +2260,7 @@ func routes(_ app: Application) throws {
             data: PinnedActionsUpdatedResponse(
                 entityId: entityID,
                 nestId: nestID,
-                actionIds: input.actionIds + retained
+                actionIds: updatedPins
             )
         )
 
