@@ -22,6 +22,9 @@ struct TrackerPrivacyPolicy: Sendable {
                 if let id = reminder.id { owners[id] = trackerOwners[reminder.trackerID] ?? reminder.linkedTrackerID.flatMap { trackerOwners[$0] } }
             }
         }
+        for routine in try await Routine.query(on: db).filter(\.$privateOwnerId != nil).all() {
+            if let id = routine.id, let owner = routine.privateOwnerId { owners[id] = owner }
+        }
         return TrackerPrivacyPolicy(owners: owners, trackerOwners: trackerOwners)
     }
 
@@ -76,7 +79,7 @@ struct TrackerPrivacyMiddleware: AsyncMiddleware {
         let policy = try await TrackerPrivacyPolicy.load(on: req.db, eventID: req.parameters.get("eventID").flatMap(UUID.init(uuidString:)))
         req.application.realtimeHub.rememberPrivateOwners(policy.owners)
         let hidden = policy.hidden(for: user)
-        for key in ["actionID", "eventID", "reminderID"] {
+        for key in ["actionID", "eventID", "reminderID", "routineID"] {
             if let raw = req.parameters.get(key), let id = UUID(uuidString: raw), hidden.contains(id) {
                 throw Abort(.notFound, reason: "Resource not found")
             }
@@ -85,9 +88,9 @@ struct TrackerPrivacyMiddleware: AsyncMiddleware {
            let json = try? JSONSerialization.jsonObject(with: Data(buffer: bytes)) {
             let references = TrackerPrivacyPolicy.referencedIDs(json)
             guard references.isDisjoint(with: hidden) else { throw Abort(.notFound, reason: "Resource not found") }
-            let sharedPath = ["routines", "care-links", "forecasts"].contains { req.url.path.split(separator: "/").contains(Substring($0)) }
+            let sharedPath = ["care-links"].contains { req.url.path.split(separator: "/").contains(Substring($0)) }
             if sharedPath && !references.isDisjoint(with: Set(policy.trackerOwners.keys)) {
-                throw Abort(.badRequest, reason: "Private trackers cannot be included in shared routines, caregiver access, or forecasts.")
+                throw Abort(.badRequest, reason: "Private trackers cannot be included in caregiver access.")
             }
         }
         let response = try await next.respond(to: req)
