@@ -95,6 +95,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(CreatePhotoDeletionJobs())
     app.migrations.add(AddTermsAcceptance())
     app.migrations.add(AddManualProAccess())
+    app.migrations.add(AddPrivateTrackers())
     app.lifecycle.use(PhotoDeletionLifecycle())
     // Real deployments and clean local accounts should never receive sample family data.
     if app.environment == .development && Environment.get("SEED_DEMO_DATA") == "true" {
