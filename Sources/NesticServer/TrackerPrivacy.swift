@@ -17,7 +17,8 @@ struct TrackerPrivacyPolicy: Sendable {
         if !trackerOwners.isEmpty {
             let ids = Array(trackerOwners.keys)
             if let eventID, let event = try await ActionEvent.find(eventID, on: db), let owner = trackerOwners[event.$action.id] { owners[eventID] = owner }
-            for reminder in try await NestReminder.query(on: db).group(.or) { $0.filter(\.$trackerID ~~ ids).filter(\.$linkedTrackerID ~~ ids) }.all() {
+            let reminders = try await NestReminder.query(on: db).group(.or) { $0.filter(\.$trackerID ~~ ids).filter(\.$linkedTrackerID ~~ ids) }.all()
+            for reminder in reminders {
                 if let id = reminder.id { owners[id] = trackerOwners[reminder.trackerID] ?? reminder.linkedTrackerID.flatMap { trackerOwners[$0] } }
             }
         }
