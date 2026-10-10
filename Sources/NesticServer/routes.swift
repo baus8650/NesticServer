@@ -30,7 +30,13 @@ final class RealtimeHub: @unchecked Sendable {
     private let lock = NIOLock()
     private struct Connection { let socket: WebSocket; let userId: UUID }
     private var privateOwners: [UUID: UUID] = [:]
-    func rememberPrivateOwners(_ owners: [UUID: UUID]) { lock.withLock { privateOwners.merge(owners) { _, new in new } } }
+    private var privateReaders: [UUID: Set<UUID>] = [:]
+    func rememberPrivateOwners(_ owners: [UUID: UUID], readers: [UUID: Set<UUID>] = [:]) {
+        lock.withLock {
+            privateOwners.merge(owners) { _, new in new }
+            privateReaders.merge(readers) { _, new in new }
+        }
+    }
     private var socketsByNest: [UUID: [ObjectIdentifier: Connection]] = [:]
 
     func add(_ ws: WebSocket, to nestId: UUID, userId: UUID) {
@@ -75,7 +81,7 @@ final class RealtimeHub: @unchecked Sendable {
 
     func broadcast<T: Content>(nestId: UUID, type: String, data: T) {
         let connections = lock.withLock { Array((socketsByNest[nestId] ?? [:]).values) }
-        let owners = lock.withLock { privateOwners }
+        let (owners, readers) = lock.withLock { (privateOwners, privateReaders) }
         let sockets = connections.map(\.socket)
 
         guard !sockets.isEmpty else { return }
@@ -95,7 +101,7 @@ final class RealtimeHub: @unchecked Sendable {
                 rememberPrivateOwners([id: owner]); currentOwners[id] = owner
             }
             for connection in connections {
-                let hidden = Set(currentOwners.filter { $0.value != connection.userId }.keys)
+                let hidden = Set(currentOwners.filter { id, owner in !(readers[id] ?? [owner]).contains(connection.userId) }.keys)
                 guard let clean = TrackerPrivacyPolicy.filtered(json, hidden: hidden) else { continue }
                 let bytes = try JSONSerialization.data(withJSONObject: clean)
                 guard let text = String(data: bytes, encoding: .utf8) else { continue }
@@ -185,6 +191,7 @@ struct UpsertNestForecastRequest: Content {
     let inputNames: [String]
     let lastEventAt: Date
     let computedAt: Date
+    var inputTrackerIDs: [UUID]? = nil
 }
 
 struct NestReminderResponse: Content {
@@ -256,6 +263,7 @@ struct TrackableActionResponse: Content {
     let createdAt: Date?
     let updatedAt: Date?
     var privateOwnerId: UUID? = nil
+    var allowedMemberIDs: [UUID]? = nil
 }
 
 struct ActionEventResponse: Content {
@@ -659,7 +667,7 @@ private func forecastResponse(_ forecast: NestForecast) throws -> NestForecastRe
 
 func routes(_ app: Application) throws {
     let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware(), TrackerPrivacyMiddleware())
-    protected.get("capabilities") { _ in ["privateTrackers": true, "privateRoutines": true, "privateForecasts": true] }
+    protected.get("capabilities") { _ in ["privateTrackers": true, "privateRoutines": true, "privateForecasts": true, "selectedTrackerMembers": true] }
     try authRoutes(app)
     registerPhotoRoutes(protected)
 
@@ -712,7 +720,7 @@ func routes(_ app: Application) throws {
                                     unit: action.unit, symbol: action.symbol,
                                     color: action.color, groupName: action.groupName,
                                     description: action.description,
-                                    createdAt: action.createdAt, updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId)
+                                    createdAt: action.createdAt, updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
         }
 
         let routines = try await Routine.query(on: req.db)
@@ -1026,7 +1034,8 @@ func routes(_ app: Application) throws {
         let storedForecasts = try await NestForecast.query(on: req.db)
             .filter(\.$nest.$id == nestID)
             .all()
-        for forecast in storedForecasts {
+        let hiddenForecastTrackers = try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId)
+        for forecast in storedForecasts where !hiddenForecastTrackers.contains(forecast.$action.id) {
             let latestIncludedEvent = try await ActionEvent.query(on: req.db)
                 .filter(\.$entity.$id == forecast.$entity.id)
                 .filter(\.$action.$id == forecast.$action.id)
@@ -1071,8 +1080,21 @@ func routes(_ app: Application) throws {
                 continue
             }
 
-            let targetNamesJSON = try encodedForecastNames(item.targetNames)
-            let inputNamesJSON = try encodedForecastNames(item.inputNames)
+            let targetNamesJSON = try encodedForecastNames([action.name])
+            let candidateInputs = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).all()
+            let audience: Set<UUID>? = action.privateOwnerId.map { Set(action.allowedMemberIDs ?? []).union([$0]) }
+            let safeSources = candidateInputs.filter { source in
+                guard let owner = source.privateOwnerId else { return true }
+                guard let audience else { return false }
+                return audience.isSubset(of: Set(source.allowedMemberIDs ?? []).union([owner]))
+            }
+            let safeNames = Set(safeSources.map(\.name))
+            let inputIDs = item.inputTrackerIDs.map(Set.init)
+            let namedSources = candidateInputs.filter { inputIDs?.contains($0.id ?? UUID()) == true }
+            let provenInputs = inputIDs.map { $0.isSubset(of: Set(safeSources.compactMap(\.id))) && Set(item.inputNames).isSubset(of: Set(namedSources.map(\.name))) } ?? false
+            let needsInputProof = action.privateOwnerId == nil || !(action.allowedMemberIDs ?? []).isEmpty
+            let useSafeBaseline = needsInputProof && !provenInputs
+            let inputNamesJSON = try encodedForecastNames(item.inputNames.filter { safeNames.contains($0) })
             let forecast = existing ?? NestForecast(
                 nestID: nestID, entityID: item.subjectId, actionID: item.trackerId,
                 generatedByUserID: session.userId, predictedAt: item.predictedAt,
@@ -1100,6 +1122,24 @@ func routes(_ app: Application) throws {
             forecast.inputNamesJSON = inputNamesJSON
             forecast.lastEventAt = item.lastEventAt
             forecast.computedAt = item.computedAt
+            if useSafeBaseline {
+                // Legacy clients cannot attest to their learning inputs. Derive a
+                // baseline strictly from this target's authorized event history.
+                let events = try await ActionEvent.query(on: req.db).filter(\.$entity.$id == item.subjectId)
+                    .filter(\.$action.$id == item.trackerId).filter(\.$includeInPredictions == true)
+                    .filter(\.$wasAccident == false).sort(\.$occurredAt, .descending).limit(31).all()
+                let dates = events.map(\.occurredAt).sorted()
+                let intervals = zip(dates, dates.dropFirst()).map { $1.timeIntervalSince($0) / 3600 }.filter { $0 > 0 }
+                guard let last = dates.last, !intervals.isEmpty else { continue }
+                let interval = min(72, max(0.25, intervals.reduce(0, +) / Double(intervals.count)))
+                let date = last.addingTimeInterval(interval * 3600)
+                forecast.predictedAt = date; forecast.baselinePredictedAt = date
+                forecast.contextualPredictedAt = nil; forecast.model = "baseline"
+                forecast.intervalHours = interval; forecast.confidence = 0.5
+                forecast.sampleCount = intervals.count; forecast.validationSampleCount = 0
+                forecast.expectedErrorHours = nil; forecast.predictionWindowHours = 0
+                forecast.inputNamesJSON = "[]"; forecast.lastEventAt = last
+            }
             try await forecast.save(on: req.db)
         }
 
@@ -1582,6 +1622,11 @@ func routes(_ app: Application) throws {
             for link in links {
                 link.revokedAt = Date()
                 try await link.save(on: tx)
+            }
+            let restricted = try await TrackableAction.query(on: tx).filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil).all()
+            for tracker in restricted where tracker.privateOwnerId == targetUserID || (tracker.allowedMemberIDs ?? []).contains(targetUserID) {
+                tracker.allowedMemberIDs = tracker.privateOwnerId == targetUserID ? [] : (tracker.allowedMemberIDs ?? []).filter { $0 != targetUserID }
+                try await tracker.save(on: tx)
             }
             try await membership.delete(on: tx)
         }
@@ -2079,6 +2124,36 @@ func routes(_ app: Application) throws {
         return response
     }
 
+    protected.put("actions", ":actionID", "sharing") { req async throws -> TrackableActionResponse in
+        let session = try req.auth.require(SessionToken.self)
+        let id = try req.parameters.require("actionID", as: UUID.self)
+        guard let action = try await TrackableAction.find(id, on: req.db), action.privateOwnerId == session.userId,
+              let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == action.$nest.id)
+                .filter(\.$user.$id == session.userId).first(), member.role != .viewer else {
+            throw Abort(.forbidden, reason: "Only the creator can change sharing for a restricted tracker.")
+        }
+        struct Sharing: Content { let allowedMemberIDs: [UUID] }
+        let input = try req.content.decode(Sharing.self)
+        let members = try await NestMember.query(on: req.db).filter(\.$nest.$id == action.$nest.id).filter(\.$role != .viewer).all()
+        let eligible = Set(members.map { $0.$user.id })
+        let selected = Set(input.allowedMemberIDs).subtracting([session.userId])
+        guard selected.count <= 100, selected.isSubset(of: eligible) else {
+            throw Abort(.badRequest, reason: "Select current nest members who can log updates.")
+        }
+        // Discard forecasts computed for the previous audience before expanding access.
+        try await NestForecast.query(on: req.db).filter(\.$nest.$id == action.$nest.id).delete()
+        action.allowedMemberIDs = Array(selected).sorted { $0.uuidString < $1.uuidString }
+        try await action.save(on: req.db)
+        let policy = try await TrackerPrivacyPolicy.load(on: req.db)
+        req.application.realtimeHub.rememberPrivateOwners(policy.owners, readers: policy.readers)
+        // All members receive a content-free refresh signal, including revoked readers.
+        req.application.realtimeHub.broadcast(nestId: action.$nest.id, type: "permissions.updated", data: [String: String]())
+        return TrackableActionResponse(id: try action.requireID(), nestId: action.$nest.id, name: action.name,
+            valueType: action.valueType, unit: action.unit, symbol: action.symbol, color: action.color,
+            groupName: action.groupName, description: action.description, createdAt: action.createdAt,
+            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
+    }
+
     // Edit a tracker. Existing events retain their recorded values; only the tracker metadata changes.
     protected.patch("actions", ":actionID") { req async throws -> TrackableActionResponse in
         let session = try req.auth.require(SessionToken.self)
@@ -2097,7 +2172,7 @@ func routes(_ app: Application) throws {
             .first() != nil
         let privateMembership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).filter(\.$role != .viewer).first()
         let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
-        guard canManage || canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
+        guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         struct UpdateActionRequest: Content {
             let name: String?
@@ -2127,7 +2202,7 @@ func routes(_ app: Application) throws {
                                                groupName: action.groupName,
                                                description: action.description,
                                                createdAt: action.createdAt,
-                                               updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId)
+                                               updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)
         return response
     }
@@ -2150,7 +2225,7 @@ func routes(_ app: Application) throws {
             .first() != nil
         let privateMembership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).filter(\.$role != .viewer).first()
         let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
-        guard canManage || canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
+        guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         let deleted = ActionDeletedResponse(id: actionID, nestId: nestID)
         let eventPhotoKeys = try await ActionEvent.query(on: req.db)
@@ -2279,11 +2354,12 @@ func routes(_ app: Application) throws {
             }
             let otherPrivate = try await TrackableAction.query(on: tx)
                 .filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil)
-                .filter(\.$privateOwnerId != session.userId).all().compactMap(\.id)
+                .filter(\.$privateOwnerId != session.userId).all().filter { !($0.allowedMemberIDs ?? []).contains(session.userId) }.compactMap(\.id)
             let retained = try await EntityPinnedAction.query(on: tx)
                 .filter(\.$entity.$id == entityID).filter(\.$action.$id ~~ otherPrivate)
                 .all().map { $0.$action.id }
-            let combined = input.actionIds + retained
+            var seen: Set<UUID> = []
+            let combined = (input.actionIds + retained).filter { seen.insert($0).inserted }
             try await EntityPinnedAction.query(on: tx).filter(\.$entity.$id == entityID).delete()
             for (idx, actionID) in combined.enumerated() {
                 try await EntityPinnedAction(entityID: entityID, actionID: actionID, sortOrder: idx).save(on: tx)
@@ -2633,7 +2709,7 @@ func routes(_ app: Application) throws {
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
         }
-        let hiddenActions = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil).filter(\.$privateOwnerId != session.userId).all().compactMap(\.id)
+        let hiddenActions = Array(try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId))
         if !hiddenActions.isEmpty { query = query.filter(\.$action.$id !~ hiddenActions) }
         let events = try await query.range(..<limit).all()
 
@@ -2676,7 +2752,7 @@ func routes(_ app: Application) throws {
         if let before = eventCursorDate(from: req) {
             query = query.filter(\.$occurredAt < before)
         }
-        let hiddenActions = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$privateOwnerId != nil).filter(\.$privateOwnerId != session.userId).all().compactMap(\.id)
+        let hiddenActions = Array(try await TrackerPrivacyPolicy.load(on: req.db).hidden(for: session.userId))
         if !hiddenActions.isEmpty { query = query.filter(\.$action.$id !~ hiddenActions) }
         let events = try await query.range(..<limit).all()
         return try events.map { try $0.response() }
