@@ -112,4 +112,57 @@ struct DoseReminderTests {
             try await nest.delete(on: app.db); try await user.delete(on: app.db); try await other.delete(on: app.db)
         }
     }
+    @Test("Routine reminders reset only after a full routine log and stay private")
+    func routineReminders() async throws {
+        try await withApp { app in
+            try await app.autoMigrate()
+            let suffix = UUID().uuidString
+            let owner = User(email: "routine-reminder-\(suffix)@example.com", passwordHash: "unused", displayName: "Owner", emailVerified: true)
+            let other = User(email: "routine-other-\(suffix)@example.com", passwordHash: "unused", displayName: "Other", emailVerified: true)
+            try await owner.save(on: app.db); try await other.save(on: app.db)
+            let nest = Nest(name: "Routine reminders"); try await nest.save(on: app.db)
+            let nestID = try nest.requireID(), userID = try owner.requireID()
+            try await NestMember(nestID: nestID, userID: userID, role: .owner).save(on: app.db)
+            try await NestMember(nestID: nestID, userID: other.requireID(), role: .admin).save(on: app.db)
+            let subject = Entity(nestID: nestID, kind: .person, name: "Me"); try await subject.save(on: app.db)
+            let tracker = TrackableAction(nestID: nestID, name: "Private update", valueType: .none)
+            tracker.privateOwnerId = userID; try await tracker.save(on: app.db)
+            let subjectID = try subject.requireID(), trackerID = try tracker.requireID()
+            try await EntityPinnedAction(entityID: subjectID, actionID: trackerID, sortOrder: 0).save(on: app.db)
+            let routine = Routine(nestID: nestID, name: "Private routine", targets: [RoutineTarget(entityID: subjectID, items: [RoutineItem(trackerID: trackerID, valueNumber: nil, valueText: nil, valueBool: nil, valueJSON: nil)])])
+            routine.privateOwnerId = userID; try await routine.save(on: app.db)
+            let routineID = try routine.requireID()
+            let headers: HTTPHeaders = ["Authorization": "Bearer \(try await app.jwt.keys.sign(SessionToken(userId: userID)))"]
+            let otherHeaders: HTTPHeaders = ["Authorization": "Bearer \(try await app.jwt.keys.sign(SessionToken(userId: other.requireID())))"]
+            let api = try app.testing(), start = Date().addingTimeInterval(-3600)
+            let input = NestReminderRequest(routineID: routineID, startFromFirstTracking: true, subjectID: subjectID, trackerID: routineID, intervalHours: 8, totalPills: nil, cadence: .afterDose, linkedTrackerID: nil, delayMinutes: 0, anchorDate: start, hour: 9, minute: 0)
+            let created = try await api.sendRequest(.POST, "nests/\(nestID)/reminders", headers: headers, beforeRequest: { req async throws in try req.content.encode(input) })
+            #expect(created.status == .ok)
+            let reminder = try created.content.decode(NestReminderResponse.self)
+            #expect(reminder.routineID == routineID); #expect(reminder.lastDoseAt == nil)
+            try await ActionEvent(nestID: nestID, entityID: subjectID, actionID: trackerID, actorUserID: userID, occurredAt: Date()).save(on: app.db)
+            let unchanged = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: headers)
+            #expect(try unchanged.content.decode([NestReminderResponse].self).first?.lastDoseAt == nil)
+            struct Log: Content { let occurredAt: Date }
+            let loggedAt = Date().addingTimeInterval(-30)
+            let logged = try await api.sendRequest(.POST, "routines/\(routineID)/log", headers: headers, beforeRequest: { req async throws in try req.content.encode(Log(occurredAt: loggedAt)) })
+            #expect(logged.status == .ok)
+            let read = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: headers)
+            let last = try read.content.decode([NestReminderResponse].self).first?.lastDoseAt
+            #expect(last != nil && abs(last!.timeIntervalSince(loggedAt)) < 1)
+            let hidden = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: otherHeaders)
+            #expect(try hidden.content.decode([NestReminderResponse].self).isEmpty)
+            let guessed = try await api.sendRequest(.PUT, "nests/\(nestID)/reminders/\(reminder.id)/notification", headers: otherHeaders, beforeRequest: { req async throws in try req.content.encode(UpdateReminderNotificationRequest(enabled: true, deliveryMode: "both")) })
+            #expect(guessed.status == .notFound)
+            let weekly = NestReminderRequest(routineID: routineID, recurrenceDays: 7, subjectID: subjectID, trackerID: routineID, intervalHours: nil, totalPills: nil, cadence: .everyOtherDay, linkedTrackerID: nil, delayMinutes: 0, anchorDate: start, hour: 9, minute: 0)
+            let weeklyCreated = try await api.sendRequest(.POST, "nests/\(nestID)/reminders", headers: headers, beforeRequest: { req async throws in try req.content.encode(weekly) })
+            #expect(weeklyCreated.status == .ok)
+            #expect(try weeklyCreated.content.decode(NestReminderResponse.self).recurrenceDays == 7)
+            let deleted = try await api.sendRequest(.DELETE, "routines/\(routineID)", headers: headers)
+            #expect(deleted.status == .noContent)
+            #expect(try await NestReminder.query(on: app.db).filter(\.$routineID == routineID).count() == 0)
+            try await nest.delete(on: app.db); try await owner.delete(on: app.db); try await other.delete(on: app.db)
+        }
+    }
+
 }

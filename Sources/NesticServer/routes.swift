@@ -195,6 +195,7 @@ struct UpsertNestForecastRequest: Content {
 }
 
 struct NestReminderResponse: Content {
+    var routineID: UUID? = nil
     var recurrenceDays: Int? = nil
     var startFromFirstTracking: Bool? = nil
     let id: UUID
@@ -223,6 +224,7 @@ struct NestReminderResponse: Content {
 }
 
 struct NestReminderRequest: Content {
+    var routineID: UUID? = nil
     var recurrenceDays: Int? = nil
     var startFromFirstTracking: Bool? = nil
     let subjectID: UUID
@@ -591,8 +593,12 @@ private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled
         lastDoseAt = doses.filter { reminder.totalPills == nil || ($0.valueBool != false && ($0.valueNumber ?? 1) > 0) }.map(\.occurredAt).max()
         pillsTaken = doses.reduce(0) { $0 + max(0, $1.valueNumber ?? ($1.valueBool == false ? 0 : 1)) }
     }
+    if reminder.routineID != nil && reminder.cadence == .afterDose {
+        lastDoseAt = reminder.lastCompletedAt.flatMap { $0 >= reminder.anchorDate ? $0 : nil }
+        pillsTaken = nil
+    }
     return NestReminderResponse(
-        recurrenceDays: reminder.recurrenceDays, startFromFirstTracking: reminder.startFromFirstTracking,
+        routineID: reminder.routineID, recurrenceDays: reminder.recurrenceDays, startFromFirstTracking: reminder.startFromFirstTracking,
         id: try reminder.requireID(), nestId: reminder.$nest.id,
         subjectId: reminder.subjectID, subjectName: reminder.subjectName,
         trackerId: reminder.trackerID, trackerName: reminder.trackerName,
@@ -607,13 +613,37 @@ private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled
     )
 }
 
-private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID, on db: any Database) async throws -> (Entity, TrackableAction, TrackableAction?) {
+private struct ReminderTarget {
+    let id: UUID
+    let name: String
+    let privateOwnerId: UUID?
+}
+
+private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID, on db: any Database) async throws -> (Entity, ReminderTarget, TrackableAction?) {
     guard (0...23).contains(input.hour), (0...59).contains(input.minute),
           (0...1_440).contains(input.delayMinutes) else {
         throw Abort(.badRequest, reason: "Reminder time is invalid")
     }
     guard let subject = try await Entity.find(input.subjectID, on: db), subject.$nest.id == nestID else {
         throw Abort(.badRequest, reason: "Reminder subject is not in this nest")
+    }
+    if let routineID = input.routineID {
+        guard let routine = try await Routine.find(routineID, on: db), routine.$nest.id == nestID,
+              routineTargets(routine).contains(where: { $0.entityID == input.subjectID }), input.trackerID == routineID else {
+            throw Abort(.badRequest, reason: "Choose a routine in this nest and one of its subjects.")
+        }
+        try await validateRoutineTargets(routineTargets(routine), nestID: nestID, on: db)
+        guard input.totalPills == nil else { throw Abort(.badRequest, reason: "Pill totals belong to individual medication trackers, not routines.") }
+        if input.cadence == .afterDose {
+            guard let hours = input.intervalHours, hours.isFinite, (1.0 / 60...720).contains(hours) else { throw Abort(.badRequest, reason: "Choose an interval from 1 minute to 30 days.") }
+        }
+        if let days = input.recurrenceDays { guard input.cadence == .everyOtherDay, (1...365).contains(days) else { throw Abort(.badRequest, reason: "Choose 1 to 365 days.") } }
+        let linked: TrackableAction?
+        if input.cadence == .afterMeal {
+            guard let id = input.linkedTrackerID, let action = try await TrackableAction.find(id, on: db), action.$nest.id == nestID, action.isArchived != true else { throw Abort(.badRequest, reason: "Choose an active trigger tracker in this nest.") }
+            linked = action
+        } else { linked = nil }
+        return (subject, ReminderTarget(id: routineID, name: routine.name, privateOwnerId: routine.privateOwnerId), linked)
     }
     guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID, tracker.isArchived != true else {
         throw Abort(.badRequest, reason: "Choose an active reminder tracker in this nest")
@@ -636,9 +666,9 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
               linkedID != input.trackerID else {
             throw Abort(.badRequest, reason: "Choose another tracker that triggers this reminder")
         }
-        return (subject, tracker, linked)
+        return (subject, ReminderTarget(id: try tracker.requireID(), name: tracker.name, privateOwnerId: tracker.privateOwnerId), linked)
     }
-    return (subject, tracker, nil)
+    return (subject, ReminderTarget(id: try tracker.requireID(), name: tracker.name, privateOwnerId: tracker.privateOwnerId), nil)
 }
 
 private func encodedForecastNames(_ names: [String]) throws -> String {
@@ -846,6 +876,11 @@ func routes(_ app: Application) throws {
                     try await event.save(on: tx)
                     created.append(event)
                 }
+            }
+            let reminders = try await NestReminder.query(on: tx).filter(\.$routineID == routineID).all()
+            for reminder in reminders where reminder.lastCompletedAt == nil || occurredAt > reminder.lastCompletedAt! {
+                reminder.lastCompletedAt = occurredAt
+                try await reminder.save(on: tx)
             }
             return created
         }
@@ -1201,11 +1236,12 @@ func routes(_ app: Application) throws {
         let user = try await User.find(session.userId, on: req.db)
         let creatorName = user?.displayName ?? user?.email ?? "Nest member"
         let reminder = NestReminder(nestID: nestID, subjectID: try subject.requireID(), subjectName: subject.name,
-                                    trackerID: try tracker.requireID(), trackerName: tracker.name,
+                                    trackerID: tracker.id, trackerName: tracker.name,
                                     cadence: input.cadence, linkedTrackerID: linkedTracker.flatMap { try? $0.requireID() },
                                     linkedTrackerName: linkedTracker?.name, delayMinutes: input.delayMinutes,
                                     anchorDate: input.anchorDate, hour: input.hour, minute: input.minute,
                                     createdByUserID: session.userId, createdByName: creatorName)
+        reminder.routineID = input.routineID
         reminder.recurrenceDays = input.cadence == .everyOtherDay ? input.recurrenceDays : nil
         reminder.startFromFirstTracking = input.startFromFirstTracking
         reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
@@ -1234,14 +1270,16 @@ func routes(_ app: Application) throws {
         let oldTracker = try await TrackableAction.find(reminder.trackerID, on: req.db)
         let oldLinked: TrackableAction?
         if let linkedID = reminder.linkedTrackerID { oldLinked = try await TrackableAction.find(linkedID, on: req.db) } else { oldLinked = nil }
-        let oldOwner = oldTracker?.privateOwnerId ?? oldLinked?.privateOwnerId
+        let oldRoutine: Routine?
+        if let routineID = reminder.routineID { oldRoutine = try await Routine.find(routineID, on: req.db) } else { oldRoutine = nil }
+        let oldOwner = oldRoutine?.privateOwnerId ?? oldTracker?.privateOwnerId ?? oldLinked?.privateOwnerId
         let newOwner = tracker.privateOwnerId ?? linkedTracker?.privateOwnerId
         guard oldOwner == newOwner else {
             throw Abort(.badRequest, reason: "Create a new reminder to change between shared and private visibility.")
         }
         reminder.subjectID = try subject.requireID()
         reminder.subjectName = subject.name
-        reminder.trackerID = try tracker.requireID()
+        reminder.trackerID = tracker.id
         reminder.trackerName = tracker.name
         reminder.cadence = input.cadence
         reminder.linkedTrackerID = linkedTracker.flatMap { try? $0.requireID() }
@@ -1250,6 +1288,7 @@ func routes(_ app: Application) throws {
         reminder.anchorDate = input.anchorDate
         reminder.hour = input.hour
         reminder.minute = input.minute
+        reminder.routineID = input.routineID
         reminder.recurrenceDays = input.cadence == .everyOtherDay ? input.recurrenceDays : nil
         reminder.startFromFirstTracking = input.startFromFirstTracking
         reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
@@ -1996,6 +2035,7 @@ func routes(_ app: Application) throws {
                 let remainingTargets = routineTargets(routine).filter { $0.entityID != entityID }
                 guard remainingTargets.count != routineTargets(routine).count else { continue }
                 if remainingTargets.isEmpty {
+                    try await NestReminder.query(on: tx).filter(\.$routineID == routine.id).delete()
                     try await routine.delete(on: tx)
                 } else {
                     routine.$entity.id = remainingTargets[0].entityID
@@ -2319,6 +2359,7 @@ func routes(_ app: Application) throws {
                     return items.isEmpty ? nil : RoutineTarget(entityID: target.entityID, items: items)
                 }
                 if remainingTargets.isEmpty {
+                    try await NestReminder.query(on: tx).filter(\.$routineID == routine.id).delete()
                     try await routine.delete(on: tx)
                 } else if remainingTargets != existingTargets || routine.targets != nil {
                     routine.$entity.id = remainingTargets[0].entityID
@@ -2382,6 +2423,7 @@ func routes(_ app: Application) throws {
                     return items.isEmpty ? nil : RoutineTarget(entityID: target.entityID, items: items)
                 }
                 if remainingTargets.isEmpty {
+                    try await NestReminder.query(on: tx).filter(\.$routineID == routine.id).delete()
                     try await routine.delete(on: tx)
                 } else if remainingTargets != existingTargets || routine.targets != nil {
                     routine.$entity.id = remainingTargets[0].entityID
@@ -2648,6 +2690,7 @@ func routes(_ app: Application) throws {
             throw Abort(.forbidden, reason: "Owner or admin role required")
         }
 
+        try await NestReminder.query(on: req.db).filter(\.$routineID == routineID).delete()
         try await routine.delete(on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "routine.deleted",
                                               data: RoutineDeletedResponse(id: routineID, nestId: nestID))
@@ -2701,6 +2744,11 @@ func routes(_ app: Application) throws {
                     try await event.save(on: tx)
                     created.append(event)
                 }
+            }
+            let reminders = try await NestReminder.query(on: tx).filter(\.$routineID == routineID).all()
+            for reminder in reminders where reminder.lastCompletedAt == nil || occurredAt > reminder.lastCompletedAt! {
+                reminder.lastCompletedAt = occurredAt
+                try await reminder.save(on: tx)
             }
             return created
         }

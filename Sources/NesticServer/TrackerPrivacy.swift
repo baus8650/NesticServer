@@ -41,6 +41,15 @@ struct TrackerPrivacyPolicy: Sendable {
                 readers[id] = trackerIDs.compactMap { readers[$0] }.reduce(Set([owner])) { $0.intersection($1) }
             }
         }
+        for reminder in try await NestReminder.query(on: db).filter(\.$routineID != nil).all() {
+            guard let id = reminder.id, let routineID = reminder.routineID else { continue }
+            let dependencyIDs = [routineID, reminder.linkedTrackerID].compactMap { $0 }
+            if let owner = dependencyIDs.compactMap({ owners[$0] }).first {
+                owners[id] = owner
+                let audiences = dependencyIDs.compactMap { readers[$0] }
+                readers[id] = audiences.reduce(audiences.first ?? Set([owner])) { $0.intersection($1) }
+            }
+        }
         return TrackerPrivacyPolicy(owners: owners, trackerOwners: trackerOwners, readers: readers)
     }
 
@@ -63,7 +72,7 @@ struct TrackerPrivacyPolicy: Sendable {
         }
         if let array = value as? [Any] { return array.compactMap { filtered($0, hidden: hidden) } }
         if let object = value as? [String: Any] {
-            for key in ["id", "eventId", "eventID", "actionId", "actionID", "trackerId", "trackerID", "linkedTrackerId", "linkedTrackerID"] {
+            for key in ["id", "eventId", "eventID", "actionId", "actionID", "trackerId", "trackerID", "linkedTrackerId", "linkedTrackerID", "routineID", "routineId"] {
                 if let string = object[key] as? String, let id = UUID(uuidString: string), hidden.contains(id) { return nil }
             }
             var result: [String: Any] = [:]
