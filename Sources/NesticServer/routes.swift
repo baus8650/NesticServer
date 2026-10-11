@@ -195,6 +195,8 @@ struct UpsertNestForecastRequest: Content {
 }
 
 struct NestReminderResponse: Content {
+    var recurrenceDays: Int? = nil
+    var startFromFirstTracking: Bool? = nil
     let id: UUID
     let nestId: UUID
     let subjectId: UUID
@@ -221,6 +223,8 @@ struct NestReminderResponse: Content {
 }
 
 struct NestReminderRequest: Content {
+    var recurrenceDays: Int? = nil
+    var startFromFirstTracking: Bool? = nil
     let subjectID: UUID
     let trackerID: UUID
     let intervalHours: Double?
@@ -588,6 +592,7 @@ private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled
         pillsTaken = doses.reduce(0) { $0 + max(0, $1.valueNumber ?? ($1.valueBool == false ? 0 : 1)) }
     }
     return NestReminderResponse(
+        recurrenceDays: reminder.recurrenceDays, startFromFirstTracking: reminder.startFromFirstTracking,
         id: try reminder.requireID(), nestId: reminder.$nest.id,
         subjectId: reminder.subjectID, subjectName: reminder.subjectName,
         trackerId: reminder.trackerID, trackerName: reminder.trackerName,
@@ -612,6 +617,9 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
     }
     guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID, tracker.isArchived != true else {
         throw Abort(.badRequest, reason: "Choose an active reminder tracker in this nest")
+    }
+    if let days = input.recurrenceDays {
+        guard input.cadence == .everyOtherDay, (1...365).contains(days) else { throw Abort(.badRequest, reason: "Choose a repeat interval from 1 to 365 days.") }
     }
     if input.cadence == .afterDose {
         guard let hours = input.intervalHours, hours.isFinite, hours >= 1.0 / 60.0, hours <= 720,
@@ -1198,6 +1206,8 @@ func routes(_ app: Application) throws {
                                     linkedTrackerName: linkedTracker?.name, delayMinutes: input.delayMinutes,
                                     anchorDate: input.anchorDate, hour: input.hour, minute: input.minute,
                                     createdByUserID: session.userId, createdByName: creatorName)
+        reminder.recurrenceDays = input.cadence == .everyOtherDay ? input.recurrenceDays : nil
+        reminder.startFromFirstTracking = input.startFromFirstTracking
         reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
         reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)
@@ -1240,6 +1250,8 @@ func routes(_ app: Application) throws {
         reminder.anchorDate = input.anchorDate
         reminder.hour = input.hour
         reminder.minute = input.minute
+        reminder.recurrenceDays = input.cadence == .everyOtherDay ? input.recurrenceDays : nil
+        reminder.startFromFirstTracking = input.startFromFirstTracking
         reminder.intervalHours = input.cadence == .afterDose ? input.intervalHours : nil
         reminder.totalPills = input.cadence == .afterDose ? input.totalPills : nil
         try await reminder.save(on: req.db)

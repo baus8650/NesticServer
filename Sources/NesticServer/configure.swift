@@ -98,6 +98,7 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(AddPrivateTrackers())
     app.migrations.add(AddPrivateRoutines())
     app.migrations.add(AddDoseReminders())
+    app.migrations.add(AddReminderScheduleOptions())
     app.migrations.add(AddTrackerSharing())
     app.migrations.add(AddReminderDelivery())
     app.migrations.add(ArchiveTrackers())

@@ -25,6 +25,8 @@ final class NestReminder: Model, Content, @unchecked Sendable {
     @OptionalField(key: "linked_tracker_name") var linkedTrackerName: String?
     @Field(key: "delay_minutes") var delayMinutes: Int
     @OptionalField(key: "interval_hours") var intervalHours: Double?
+    @OptionalField(key: "recurrence_days") var recurrenceDays: Int?
+    @OptionalField(key: "start_from_first_tracking") var startFromFirstTracking: Bool?
     @OptionalField(key: "total_pills") var totalPills: Int?
     @Field(key: "anchor_date") var anchorDate: Date
     @Field(key: "hour") var hour: Int
