@@ -2324,6 +2324,70 @@ func routes(_ app: Application) throws {
         return .noContent
     }
 
+    // Permanently remove the tracker, history, photos and dependent configuration.
+    protected.delete("actions", ":actionID", "permanent") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let actionID = try req.parameters.require("actionID", as: UUID.self)
+        guard let action = try await TrackableAction.find(actionID, on: req.db) else {
+            throw Abort(.notFound, reason: "Tracker not found")
+        }
+        let nestID = action.$nest.id
+        let canManage = try await NestMember.query(on: req.db)
+            .filter(\.$nest.$id == nestID)
+            .filter(\.$user.$id == session.userId)
+            .group(.or) { q in
+                q.filter(\.$role == .owner)
+                q.filter(\.$role == .admin)
+            }
+            .first() != nil
+        let privateMembership = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).filter(\.$role != .viewer).first()
+        let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
+        guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
+
+        let deleted = ActionDeletedResponse(id: actionID, nestId: nestID)
+        let photoKeys: [String] = try await req.db.transaction { tx in
+            let events = try await ActionEvent.query(on: tx).filter(\.$action.$id == actionID).all()
+            let ids = try events.map { try $0.requireID() }
+            var urls = events.compactMap(\.photoURL)
+            if !ids.isEmpty {
+                let photos = try await ActionEventPhoto.query(on: tx).filter(\.$event.$id ~~ ids).all()
+                urls += photos.map(\.photoURL)
+                try await ActionEventPhoto.query(on: tx).filter(\.$event.$id ~~ ids).delete()
+                try await ActionEvent.query(on: tx).filter(\.$id ~~ ids).delete()
+            }
+            try await EntityPinnedAction.query(on: tx).filter(\.$action.$id == actionID).delete()
+            try await NestReminder.query(on: tx).filter(\.$nest.$id == nestID).group(.or) { q in
+                q.filter(\.$trackerID == actionID); q.filter(\.$linkedTrackerID == actionID)
+            }.delete()
+            try await NestForecast.query(on: tx).filter(\.$nest.$id == nestID).delete()
+            let routines = try await Routine.query(on: tx)
+                .filter(\.$nest.$id == nestID)
+                .all()
+            for routine in routines {
+                let existingTargets = routineTargets(routine)
+                let remainingTargets = existingTargets.compactMap { target -> RoutineTarget? in
+                    let items = target.items.filter { $0.trackerID != actionID }
+                    return items.isEmpty ? nil : RoutineTarget(entityID: target.entityID, items: items)
+                }
+                if remainingTargets.isEmpty {
+                    try await routine.delete(on: tx)
+                } else if remainingTargets != existingTargets || routine.targets != nil {
+                    routine.$entity.id = remainingTargets[0].entityID
+                    routine.items = RoutineItems(remainingTargets[0].items)
+                    routine.targets = routine.targets == nil && remainingTargets.count == 1
+                        ? nil
+                        : RoutineTargets(remainingTargets)
+                    try await routine.save(on: tx)
+                }
+            }
+            try await action.delete(on: tx)
+            return Array(Set(urls.compactMap { R2Storage.key(from: $0) }))
+        }
+        if let storage = req.application.r2Storage { for key in photoKeys { try? await storage.delete(key: key, logger: req.logger) } }
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "action.deleted", data: deleted)
+        return .noContent
+    }
+
     // MARK: - Entity Pinned Actions API
 
     // List pinned actions for an entity (must be a member of the entity's nest)
