@@ -68,6 +68,7 @@ final class NestReminderPreference: Model, Content, @unchecked Sendable {
     @Parent(key: "reminder_id") var reminder: NestReminder
     @Parent(key: "user_id") var user: User
     @Field(key: "enabled") var enabled: Bool
+    @OptionalField(key: "delivery_mode") var deliveryMode: String?
     @Timestamp(key: "updated_at", on: .update) var updatedAt: Date?
 
     init() {}

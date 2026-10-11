@@ -30,6 +30,8 @@ final class TrackableAction: Model, Content, @unchecked Sendable {
     @OptionalField(key: "private_owner_id")
     var privateOwnerId: UUID?
 
+    @OptionalField(key: "is_archived") var isArchived: Bool?
+
     @OptionalField(key: "allowed_member_ids")
     var allowedMemberIDs: [UUID]?
 

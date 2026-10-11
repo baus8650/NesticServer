@@ -1,0 +1,83 @@
+@testable import NesticServer
+import Testing
+import VaporTesting
+import Fluent
+
+@Suite("Tracker history clearing", .serialized, .enabled(if: Environment.get("RUN_DATABASE_TESTS") == "true"))
+struct TrackerHistoryTests {
+    @Test("Clearing preserves configuration and unrelated history, including after archiving")
+    func clearHistory() async throws {
+        let app = try await Application.make(.testing)
+        do {
+            try await configure(app); try await app.autoMigrate()
+            let suffix = UUID().uuidString
+            let owner = User(email: "history-owner-\(suffix)@example.com", passwordHash: "unused", displayName: "Owner", emailVerified: true)
+            let reader = User(email: "history-reader-\(suffix)@example.com", passwordHash: "unused", displayName: "Reader", emailVerified: true)
+            try await owner.save(on: app.db); try await reader.save(on: app.db)
+            let ownerID = try owner.requireID(), readerID = try reader.requireID()
+            let nest = Nest(name: "History clearing"); try await nest.save(on: app.db)
+            let nestID = try nest.requireID()
+            try await NestMember(nestID: nestID, userID: ownerID, role: .owner).save(on: app.db)
+            try await NestMember(nestID: nestID, userID: readerID, role: .admin).save(on: app.db)
+            let subject = Entity(nestID: nestID, kind: .person, name: "Person"); try await subject.save(on: app.db)
+            let subjectID = try subject.requireID()
+            let tracker = TrackableAction(nestID: nestID, name: "Restricted history", valueType: .none)
+            tracker.privateOwnerId = ownerID; tracker.allowedMemberIDs = [readerID]; try await tracker.save(on: app.db)
+            let trackerID = try tracker.requireID()
+            let other = TrackableAction(nestID: nestID, name: "Other history", valueType: .none); try await other.save(on: app.db)
+            let otherID = try other.requireID()
+            try await EntityPinnedAction(entityID: subjectID, actionID: trackerID, sortOrder: 0).save(on: app.db)
+            let event = ActionEvent(nestID: nestID, entityID: subjectID, actionID: trackerID, actorUserID: ownerID, occurredAt: Date())
+            event.photoURL = "r2://history/main.jpg"; try await event.save(on: app.db)
+            let eventID = try event.requireID()
+            try await ActionEventPhoto(eventID: eventID, actorUserID: ownerID, capturedAt: Date(), photoURL: "r2://history/update.jpg").save(on: app.db)
+            try await ActionEvent(nestID: nestID, entityID: subjectID, actionID: otherID, actorUserID: ownerID, occurredAt: Date()).save(on: app.db)
+            let ownerToken = try await app.jwt.keys.sign(SessionToken(userId: ownerID))
+            let readerToken = try await app.jwt.keys.sign(SessionToken(userId: readerID))
+            let ownerHeaders: HTTPHeaders = ["Authorization": "Bearer \(ownerToken)"]
+            let readerHeaders: HTTPHeaders = ["Authorization": "Bearer \(readerToken)"]
+            let api = try app.testing()
+            let reminderInput = NestReminderRequest(subjectID: subjectID, trackerID: trackerID, intervalHours: 8, totalPills: nil, cadence: .afterDose, linkedTrackerID: nil, delayMinutes: 0, anchorDate: Date().addingTimeInterval(-3600), hour: 0, minute: 0)
+            let created = try await api.sendRequest(.POST, "nests/\(nestID)/reminders", headers: ownerHeaders, beforeRequest: { req async throws in try req.content.encode(reminderInput) })
+            #expect(created.status == .ok)
+            #expect(try await api.sendRequest(.DELETE, "actions/\(trackerID)/history", headers: readerHeaders).status == .forbidden)
+            #expect(try await ActionEvent.find(eventID, on: app.db) != nil)
+            #expect(try await api.sendRequest(.DELETE, "actions/\(trackerID)/history", headers: ownerHeaders).status == .noContent)
+            #expect(try await ActionEvent.query(on: app.db).filter(\.$action.$id == trackerID).count() == 0)
+            #expect(try await ActionEventPhoto.query(on: app.db).filter(\.$event.$id == eventID).count() == 0)
+            #expect(try await ActionEvent.query(on: app.db).filter(\.$action.$id == otherID).count() == 1)
+            #expect(try await EntityPinnedAction.query(on: app.db).filter(\.$action.$id == trackerID).count() == 1)
+            let remindersResponse = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: ownerHeaders)
+            let reminders = try remindersResponse.content.decode([NestReminderResponse].self)
+            #expect(reminders.count == 1); #expect(reminders.first?.lastDoseAt == nil); #expect(reminders.first?.intervalHours == 8)
+            let kept = try #require(try await TrackableAction.find(trackerID, on: app.db))
+            #expect(kept.isArchived != true); #expect(kept.privateOwnerId == ownerID); #expect(kept.allowedMemberIDs == [readerID])
+            #expect(try await api.sendRequest(.DELETE, "actions/\(trackerID)", headers: ownerHeaders).status == .noContent)
+            #expect(try await api.sendRequest(.DELETE, "actions/\(trackerID)/history", headers: ownerHeaders).status == .noContent)
+            #expect(try await TrackableAction.find(trackerID, on: app.db)?.isArchived == true)
+            struct RestoreInput: Content { let entityID: UUID }
+            let restoreInput = RestoreInput(entityID: subjectID)
+            let deniedRestore = try await api.sendRequest(.POST, "actions/\(trackerID)/restore", headers: readerHeaders, beforeRequest: { req async throws in try req.content.encode(restoreInput) })
+            #expect(deniedRestore.status == .forbidden)
+            for _ in 0..<2 {
+                let restored = try await api.sendRequest(.POST, "actions/\(trackerID)/restore", headers: ownerHeaders, beforeRequest: { req async throws in try req.content.encode(restoreInput) })
+                #expect(restored.status == .noContent)
+            }
+            #expect(try await TrackableAction.find(trackerID, on: app.db)?.isArchived == false)
+            #expect(try await EntityPinnedAction.query(on: app.db).filter(\.$action.$id == trackerID).count() == 1)
+            struct LogInput: Content { let actionID: UUID; let occurredAt: Date }
+            let logged = try await api.sendRequest(.POST, "entities/\(subjectID)/events", headers: ownerHeaders, beforeRequest: { req async throws in try req.content.encode(LogInput(actionID: trackerID, occurredAt: Date())) })
+            #expect(logged.status == .ok)
+            #expect(try await TrackableAction.find(trackerID, on: app.db)?.allowedMemberIDs == [readerID])
+            #expect(try await api.sendRequest(.DELETE, "actions/\(trackerID)", headers: ownerHeaders).status == .noContent)
+            let replacement = TrackableAction(nestID: nestID, name: tracker.name, valueType: .none)
+            replacement.privateOwnerId = ownerID; try await replacement.save(on: app.db)
+            let conflict = try await api.sendRequest(.POST, "actions/\(trackerID)/restore", headers: ownerHeaders, beforeRequest: { req async throws in try req.content.encode(restoreInput) })
+            #expect(conflict.status == .conflict)
+            #expect(try await TrackableAction.find(trackerID, on: app.db)?.isArchived == true)
+            #expect(try await ActionEvent.query(on: app.db).filter(\.$action.$id == trackerID).count() == 1)
+            try await nest.delete(on: app.db); try await owner.delete(on: app.db); try await reader.delete(on: app.db)
+            try await app.asyncShutdown()
+        } catch { try await app.asyncShutdown(); throw error }
+    }
+}

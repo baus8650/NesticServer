@@ -215,6 +215,7 @@ struct NestReminderResponse: Content {
     let lastDoseAt: Date?
     let pillsTaken: Double?
     let notificationsEnabled: Bool
+    let deliveryMode: String
     let createdAt: Date?
     let updatedAt: Date?
 }
@@ -234,6 +235,7 @@ struct NestReminderRequest: Content {
 
 struct UpdateReminderNotificationRequest: Content {
     let enabled: Bool
+    let deliveryMode: String?
 }
 
 struct EntityResponse: Content {
@@ -264,6 +266,7 @@ struct TrackableActionResponse: Content {
     let updatedAt: Date?
     var privateOwnerId: UUID? = nil
     var allowedMemberIDs: [UUID]? = nil
+    var isArchived: Bool? = nil
 }
 
 struct ActionEventResponse: Content {
@@ -539,7 +542,7 @@ private func validateRoutineItems(_ items: [RoutineItem], entityID: UUID, nestID
     let actions = try await TrackableAction.query(on: db)
         .filter(\.$id ~~ trackerIDs)
         .all()
-    guard actions.count == items.count, actions.allSatisfy({ $0.$nest.id == nestID }) else {
+    guard actions.count == items.count, actions.allSatisfy({ $0.$nest.id == nestID && $0.isArchived != true }) else {
         throw Abort(.badRequest, reason: "Every routine tracker must belong to the same nest.")
     }
 
@@ -571,7 +574,7 @@ private func eventCursorDate(from req: Request) -> Date? {
     return nil
 }
 
-private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool, on db: any Database) async throws -> NestReminderResponse {
+private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled: Bool, deliveryMode: String = "notification", on db: any Database) async throws -> NestReminderResponse {
     var lastDoseAt: Date?
     var pillsTaken: Double?
     if reminder.cadence == .afterDose {
@@ -581,7 +584,7 @@ private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled
             .filter(\.$action.$id == reminder.trackerID)
             .filter(\.$occurredAt >= reminder.anchorDate)
             .filter(\.$occurredAt <= Date()).all()
-        lastDoseAt = doses.filter { $0.valueBool != false && ($0.valueNumber ?? 1) > 0 }.map(\.occurredAt).max()
+        lastDoseAt = doses.filter { reminder.totalPills == nil || ($0.valueBool != false && ($0.valueNumber ?? 1) > 0) }.map(\.occurredAt).max()
         pillsTaken = doses.reduce(0) { $0 + max(0, $1.valueNumber ?? ($1.valueBool == false ? 0 : 1)) }
     }
     return NestReminderResponse(
@@ -594,7 +597,7 @@ private func nestReminderResponse(_ reminder: NestReminder, notificationsEnabled
         delayMinutes: reminder.delayMinutes, anchorDate: reminder.anchorDate,
         hour: reminder.hour, minute: reminder.minute,
         createdByUserId: reminder.createdByUserID, createdByName: reminder.createdByName,
-        lastDoseAt: lastDoseAt, pillsTaken: pillsTaken, notificationsEnabled: notificationsEnabled,
+        lastDoseAt: lastDoseAt, pillsTaken: pillsTaken, notificationsEnabled: notificationsEnabled, deliveryMode: deliveryMode,
         createdAt: reminder.createdAt, updatedAt: reminder.updatedAt
     )
 }
@@ -607,21 +610,21 @@ private func validateReminderRequest(_ input: NestReminderRequest, nestID: UUID,
     guard let subject = try await Entity.find(input.subjectID, on: db), subject.$nest.id == nestID else {
         throw Abort(.badRequest, reason: "Reminder subject is not in this nest")
     }
-    guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID else {
-        throw Abort(.badRequest, reason: "Reminder tracker is not in this nest")
+    guard let tracker = try await TrackableAction.find(input.trackerID, on: db), tracker.$nest.id == nestID, tracker.isArchived != true else {
+        throw Abort(.badRequest, reason: "Choose an active reminder tracker in this nest")
     }
     if input.cadence == .afterDose {
-        guard let hours = input.intervalHours, hours.isFinite, hours >= 0.25, hours <= 720,
+        guard let hours = input.intervalHours, hours.isFinite, hours >= 1.0 / 60.0, hours <= 720,
               input.totalPills == nil || (1...100_000).contains(input.totalPills!) else {
-            throw Abort(.badRequest, reason: "Choose an interval from 0.25 to 720 hours and a positive pill total.")
+            throw Abort(.badRequest, reason: "Choose an interval from 1 minute to 30 days and a positive pill total.")
         }
-        guard tracker.valueType == .none || tracker.valueType == .number || tracker.valueType == .boolean else {
-            throw Abort(.badRequest, reason: "Dose reminders require a simple update, pill count, or yes/no tracker.")
+        guard input.totalPills == nil || tracker.valueType == .none || tracker.valueType == .number || tracker.valueType == .boolean else {
+            throw Abort(.badRequest, reason: "A pill total requires a simple update, number, or yes/no tracker.")
         }
     }
     if input.cadence == .afterMeal {
         guard let linkedID = input.linkedTrackerID,
-              let linked = try await TrackableAction.find(linkedID, on: db), linked.$nest.id == nestID,
+              let linked = try await TrackableAction.find(linkedID, on: db), linked.$nest.id == nestID, linked.isArchived != true,
               linkedID != input.trackerID else {
             throw Abort(.badRequest, reason: "Choose another tracker that triggers this reminder")
         }
@@ -720,7 +723,7 @@ func routes(_ app: Application) throws {
                                     unit: action.unit, symbol: action.symbol,
                                     color: action.color, groupName: action.groupName,
                                     description: action.description,
-                                    createdAt: action.createdAt, updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
+                                    createdAt: action.createdAt, updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs, isArchived: action.isArchived)
         }
 
         let routines = try await Routine.query(on: req.db)
@@ -769,7 +772,7 @@ func routes(_ app: Application) throws {
         guard let entity = try await Entity.find(input.entityID, on: req.db),
               entity.$nest.id == link.$nest.id,
               let action = try await TrackableAction.find(input.actionID, on: req.db),
-              action.$nest.id == link.$nest.id else {
+              action.$nest.id == link.$nest.id, action.isArchived != true else {
             throw Abort(.badRequest, reason: "Subject or tracker not found in this nest.")
         }
 
@@ -1062,8 +1065,8 @@ func routes(_ app: Application) throws {
             guard let entity = try await Entity.find(item.subjectId, on: req.db),
                   entity.$nest.id == nestID,
                   let action = try await TrackableAction.find(item.trackerId, on: req.db),
-                  action.$nest.id == nestID else {
-                throw Abort(.badRequest, reason: "The forecast subject or tracker is not in this nest")
+                  action.$nest.id == nestID, action.isArchived != true else {
+                throw Abort(.badRequest, reason: "The forecast subject or active tracker is not in this nest")
             }
 
             let existing = try await NestForecast.query(on: req.db)
@@ -1081,7 +1084,7 @@ func routes(_ app: Application) throws {
             }
 
             let targetNamesJSON = try encodedForecastNames([action.name])
-            let candidateInputs = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).all()
+            let candidateInputs = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).all().filter { $0.isArchived != true }
             let audience: Set<UUID>? = action.privateOwnerId.map { Set(action.allowedMemberIDs ?? []).union([$0]) }
             let safeSources = candidateInputs.filter { source in
                 guard let owner = source.privateOwnerId else { return true }
@@ -1170,9 +1173,10 @@ func routes(_ app: Application) throws {
         let preferences = try await NestReminderPreference.query(on: req.db)
             .filter(\.$user.$id == session.userId).filter(\.$reminder.$id ~~ ids).all()
         let enabledByID = Dictionary(uniqueKeysWithValues: preferences.map { ($0.$reminder.id, $0.enabled) })
+        let modesByID = Dictionary(uniqueKeysWithValues: preferences.map { ($0.$reminder.id, $0.deliveryMode ?? "notification") })
         var responses: [NestReminderResponse] = []
         for reminder in reminders {
-            responses.append(try await nestReminderResponse(reminder, notificationsEnabled: enabledByID[try reminder.requireID()] ?? true, on: req.db))
+            responses.append(try await nestReminderResponse(reminder, notificationsEnabled: enabledByID[try reminder.requireID()] ?? true, deliveryMode: modesByID[try reminder.requireID()] ?? "notification", on: req.db))
         }
         return responses
     }
@@ -1241,7 +1245,7 @@ func routes(_ app: Application) throws {
         try await reminder.save(on: req.db)
         let preference = try await NestReminderPreference.query(on: req.db)
             .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
-        let response = try await nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true, on: req.db)
+        let response = try await nestReminderResponse(reminder, notificationsEnabled: preference?.enabled ?? true, deliveryMode: preference?.deliveryMode ?? "notification", on: req.db)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "reminder.updated", data: response)
         return response
     }
@@ -1278,9 +1282,13 @@ func routes(_ app: Application) throws {
         let preference = try await NestReminderPreference.query(on: req.db)
             .filter(\.$reminder.$id == reminderID).filter(\.$user.$id == session.userId).first()
             ?? NestReminderPreference(reminderID: reminderID, userID: session.userId, enabled: input.enabled)
+        if let mode = input.deliveryMode {
+            guard ["notification", "alarm", "both"].contains(mode) else { throw Abort(.badRequest, reason: "Choose notification, alarm, or both") }
+            preference.deliveryMode = mode
+        }
         preference.enabled = input.enabled
         try await preference.save(on: req.db)
-        return try await nestReminderResponse(reminder, notificationsEnabled: preference.enabled, on: req.db)
+        return try await nestReminderResponse(reminder, notificationsEnabled: preference.enabled, deliveryMode: preference.deliveryMode ?? "notification", on: req.db)
     }
 
     // MARK: - Caregiver-link management
@@ -1353,7 +1361,7 @@ func routes(_ app: Application) throws {
         let actions = try await TrackableAction.query(on: req.db)
             .filter(\.$id ~~ actionIDs).all()
         guard actions.count == actionIDs.count,
-              actions.allSatisfy({ $0.$nest.id == nestID }) else {
+              actions.allSatisfy({ $0.$nest.id == nestID && $0.isArchived != true }) else {
             throw Abort(.badRequest, reason: "Every selected tracker must belong to this nest.")
         }
 
@@ -2039,7 +2047,7 @@ func routes(_ app: Application) throws {
                 groupName: a.groupName,
                 description: a.description,
                 createdAt: a.createdAt,
-                updatedAt: a.updatedAt, privateOwnerId: a.privateOwnerId
+                updatedAt: a.updatedAt, privateOwnerId: a.privateOwnerId, allowedMemberIDs: a.allowedMemberIDs, isArchived: a.isArchived
             )
         }
     }
@@ -2112,7 +2120,7 @@ func routes(_ app: Application) throws {
             groupName: action.groupName,
             description: action.description,
             createdAt: action.createdAt,
-            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId
+            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs, isArchived: action.isArchived
         )
 
         req.application.realtimeHub.broadcast(
@@ -2151,7 +2159,7 @@ func routes(_ app: Application) throws {
         return TrackableActionResponse(id: try action.requireID(), nestId: action.$nest.id, name: action.name,
             valueType: action.valueType, unit: action.unit, symbol: action.symbol, color: action.color,
             groupName: action.groupName, description: action.description, createdAt: action.createdAt,
-            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
+            updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs, isArchived: action.isArchived)
     }
 
     // Edit a tracker. Existing events retain their recorded values; only the tracker metadata changes.
@@ -2174,6 +2182,7 @@ func routes(_ app: Application) throws {
         let canManagePrivate = action.privateOwnerId == session.userId && privateMembership != nil
         guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
+        guard action.isArchived != true else { throw Abort(.conflict, reason: "Archived tracker history is read-only") }
         struct UpdateActionRequest: Content {
             let name: String?
             let valueType: ActionValueType?
@@ -2202,12 +2211,66 @@ func routes(_ app: Application) throws {
                                                groupName: action.groupName,
                                                description: action.description,
                                                createdAt: action.createdAt,
-                                               updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs)
+                                               updatedAt: action.updatedAt, privateOwnerId: action.privateOwnerId, allowedMemberIDs: action.allowedMemberIDs, isArchived: action.isArchived)
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.updated", data: response)
         return response
     }
 
-    // Delete a tracker and its quick-action pins and history in one transaction.
+    // Permanently clear recorded history while preserving tracker configuration.
+    protected.delete("actions", ":actionID", "history") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let actionID = try req.parameters.require("actionID", as: UUID.self)
+        guard let action = try await TrackableAction.find(actionID, on: req.db) else { throw Abort(.notFound) }
+        let nestID = action.$nest.id
+        guard let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first(),
+              action.privateOwnerId == nil ? (member.role == .owner || member.role == .admin) : (action.privateOwnerId == session.userId && member.role != .viewer) else {
+            throw Abort(.forbidden, reason: "Only a nest administrator or the restricted tracker's creator can clear history")
+        }
+        let photoKeys: [String] = try await req.db.transaction { tx in
+            let events = try await ActionEvent.query(on: tx).filter(\.$action.$id == actionID).all()
+            let ids = try events.map { try $0.requireID() }
+            var urls = events.compactMap(\.photoURL)
+            if !ids.isEmpty {
+                let photos = try await ActionEventPhoto.query(on: tx).filter(\.$event.$id ~~ ids).all()
+                urls += photos.map(\.photoURL)
+                try await ActionEventPhoto.query(on: tx).filter(\.$event.$id ~~ ids).delete()
+                try await ActionEvent.query(on: tx).filter(\.$id ~~ ids).delete()
+            }
+            try await NestForecast.query(on: tx).filter(\.$nest.$id == nestID).delete()
+            return Array(Set(urls.compactMap { R2Storage.key(from: $0) }))
+        }
+        if let storage = req.application.r2Storage {
+            for key in photoKeys { try? await storage.delete(key: key, logger: req.logger) }
+        }
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "action.historyCleared", data: ActionDeletedResponse(id: actionID, nestId: nestID))
+        return .noContent
+    }
+
+    protected.post("actions", ":actionID", "restore") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        let actionID = try req.parameters.require("actionID", as: UUID.self)
+        guard let action = try await TrackableAction.find(actionID, on: req.db) else { throw Abort(.notFound) }
+        let nestID = action.$nest.id
+        guard let member = try await NestMember.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$user.$id == session.userId).first(),
+              action.privateOwnerId == nil ? (member.role == .owner || member.role == .admin) : (action.privateOwnerId == session.userId && member.role != .viewer) else { throw Abort(.forbidden, reason: "Only an administrator or the restricted tracker’s creator can restore it") }
+        struct RestoreRequest: Content { let entityID: UUID }
+        let input = try req.content.decode(RestoreRequest.self)
+        guard let entity = try await Entity.find(input.entityID, on: req.db), entity.$nest.id == nestID else { throw Abort(.badRequest, reason: "Choose a subject in this nest") }
+        let conflicts = try await TrackableAction.query(on: req.db).filter(\.$nest.$id == nestID).filter(\.$name == action.name).all()
+        guard !conflicts.contains(where: { $0.id != action.id && $0.isArchived != true && $0.privateOwnerId == action.privateOwnerId }) else { throw Abort(.conflict, reason: "An active tracker already uses this name. Rename that tracker before restoring this one.") }
+        try await req.db.transaction { tx in
+            action.isArchived = false
+            try await action.save(on: tx)
+            if try await EntityPinnedAction.query(on: tx).filter(\.$entity.$id == input.entityID).filter(\.$action.$id == actionID).first() == nil {
+                let count = try await EntityPinnedAction.query(on: tx).filter(\.$entity.$id == input.entityID).count()
+                try await EntityPinnedAction(entityID: input.entityID, actionID: actionID, sortOrder: count).save(on: tx)
+            }
+        }
+        req.application.realtimeHub.broadcast(nestId: nestID, type: "action.restored", data: ActionDeletedResponse(id: actionID, nestId: nestID))
+        return .noContent
+    }
+
+    // Archive a tracker, retaining history and private photo references.
     protected.delete("actions", ":actionID") { req async throws -> HTTPStatus in
         let session = try req.auth.require(SessionToken.self)
         let actionID = try req.parameters.require("actionID", as: UUID.self)
@@ -2228,13 +2291,12 @@ func routes(_ app: Application) throws {
         guard action.privateOwnerId == nil ? canManage : canManagePrivate else { throw Abort(.forbidden, reason: "Owner or admin role required") }
 
         let deleted = ActionDeletedResponse(id: actionID, nestId: nestID)
-        let eventPhotoKeys = try await ActionEvent.query(on: req.db)
-            .filter(\.$action.$id == actionID)
-            .all()
-            .compactMap { R2Storage.key(from: $0.photoURL) }
         try await req.db.transaction { tx in
             try await EntityPinnedAction.query(on: tx).filter(\.$action.$id == actionID).delete()
-            try await ActionEvent.query(on: tx).filter(\.$action.$id == actionID).delete()
+            try await NestReminder.query(on: tx).filter(\.$nest.$id == nestID).group(.or) { q in
+                q.filter(\.$trackerID == actionID); q.filter(\.$linkedTrackerID == actionID)
+            }.delete()
+            try await NestForecast.query(on: tx).filter(\.$nest.$id == nestID).delete()
             let routines = try await Routine.query(on: tx)
                 .filter(\.$nest.$id == nestID)
                 .all()
@@ -2255,12 +2317,8 @@ func routes(_ app: Application) throws {
                     try await routine.save(on: tx)
                 }
             }
-            try await action.delete(on: tx)
-        }
-        if let storage = req.application.r2Storage {
-            for key in eventPhotoKeys {
-                try? await storage.delete(key: key, logger: req.logger)
-            }
+            action.isArchived = true
+            try await action.save(on: tx)
         }
         req.application.realtimeHub.broadcast(nestId: nestID, type: "action.deleted", data: deleted)
         return .noContent
@@ -2343,7 +2401,7 @@ func routes(_ app: Application) throws {
             throw Abort(.badRequest, reason: "One or more actions not found")
         }
 
-        guard actions.allSatisfy({ $0.$nest.id == nestID }) else {
+        guard actions.allSatisfy({ $0.$nest.id == nestID && $0.isArchived != true }) else {
             throw Abort(.badRequest, reason: "All pinned actions must belong to the entity's nest")
         }
 
@@ -2623,8 +2681,8 @@ func routes(_ app: Application) throws {
         let input = try req.content.decode(CreateEventRequest.self)
 
         guard let action = try await TrackableAction.find(input.actionID, on: req.db),
-              action.$nest.id == nestID else {
-            throw Abort(.badRequest, reason: "Action not found in the same nest as this entity")
+              action.$nest.id == nestID, action.isArchived != true else {
+            throw Abort(.badRequest, reason: "Active tracker not found in the same nest as this entity")
         }
 
         try InputValidation.event(type: action.valueType, number: input.valueNumber,

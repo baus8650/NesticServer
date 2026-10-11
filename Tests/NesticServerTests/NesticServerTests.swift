@@ -504,7 +504,9 @@ struct PostgresIntegrationTests {
             let deletedAction = try await api.sendRequest(.DELETE, "actions/\(action.id)", headers: owner)
             #expect(deletedAction.status == HTTPStatus.noContent)
             let actionsAfterDelete = try await api.sendRequest(.GET, "nests/\(nest.id)/actions", headers: owner)
-            #expect(try actionsAfterDelete.content.decode([TrackableActionResponse].self).isEmpty)
+            #expect(try actionsAfterDelete.content.decode([TrackableActionResponse].self).allSatisfy { $0.isArchived == true })
+            let retained = try await api.sendRequest(.GET, "nests/\(nest.id)/events", headers: owner)
+            #expect(Set(try retained.content.decode([ActionEventResponse].self).map(\.id)) == Set(loggedEvents.map(\.id)))
             try await Nest.find(nest.id, on: app.db)?.delete(on: app.db)
             for id in userIDs { try await User.find(id, on: app.db)?.delete(on: app.db) }
             try await app.asyncShutdown()
