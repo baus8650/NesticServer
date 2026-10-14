@@ -1949,6 +1949,7 @@ func routes(_ app: Application) throws {
             let name: String?
             let tags: [String]?
             let metadata: [String: String]?
+            let replaceProfileDetails: Bool?
             let birthday: Date?
             let imageURL: String?
         }
@@ -1959,7 +1960,7 @@ func routes(_ app: Application) throws {
         if let name = input.name { entity.name = try InputValidation.name(name) }
         if let tags = input.tags { entity.tags = tags }
         // metadata may legitimately be set to nil: allow explicit null by using a dedicated endpoint later.
-        if let metadata = input.metadata { entity.metadata = metadata }
+        if let metadata = input.metadata { entity.metadata = SubjectProfileMetadata.updated(current: entity.metadata, replacement: metadata, replaceProfileDetails: input.replaceProfileDetails == true) }
         if let birthday = input.birthday { entity.birthday = birthday }
         if let imageURL = input.imageURL { entity.imageURL = imageURL }
 
