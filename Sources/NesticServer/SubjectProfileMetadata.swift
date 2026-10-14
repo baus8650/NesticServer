@@ -13,7 +13,8 @@ enum SubjectProfileMetadata {
             history.append(WeightRecord(recordedAt: now.timeIntervalSince1970, weightKg: weight))
         }
         result.removeValue(forKey: "weightHistoryJSON")
-        if !history.isEmpty, let data = try? JSONEncoder().encode(history) { result["weightHistoryJSON"] = String(data: data, encoding: .utf8) }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        if !history.isEmpty, let data = try? encoder.encode(history) { result["weightHistoryJSON"] = String(data: data, encoding: .utf8) }
         return result
     }
 }
