@@ -1134,10 +1134,16 @@ func routes(_ app: Application) throws {
                 guard let audience else { return false }
                 return audience.isSubset(of: Set(source.allowedMemberIDs ?? []).union([owner]))
             }
-            let safeNames = Set(safeSources.map(\.name))
+            // Profile context belongs to the subject and is visible to this
+            // nest. Tracker context still needs proof for the entire audience.
+            let profileNames: Set<String> = Set([
+                entity.metadata?["birthday"] != nil ? "Subject age" : nil,
+                entity.metadata?["weightHistoryJSON"] != nil ? "Subject weight" : nil
+            ].compactMap { $0 })
+            let safeNames = Set(safeSources.map(\.name)).union(profileNames)
             let inputIDs = item.inputTrackerIDs.map(Set.init)
             let namedSources = candidateInputs.filter { inputIDs?.contains($0.id ?? UUID()) == true }
-            let provenInputs = inputIDs.map { $0.isSubset(of: Set(safeSources.compactMap(\.id))) && Set(item.inputNames).isSubset(of: Set(namedSources.map(\.name))) } ?? false
+            let provenInputs = inputIDs.map { $0.isSubset(of: Set(safeSources.compactMap(\.id))) && Set(item.inputNames).isSubset(of: Set(namedSources.map(\.name)).union(profileNames)) } ?? false
             let needsInputProof = action.privateOwnerId == nil || !(action.allowedMemberIDs ?? []).isEmpty
             let useSafeBaseline = needsInputProof && !provenInputs
             let inputNamesJSON = try encodedForecastNames(item.inputNames.filter { safeNames.contains($0) })
@@ -1894,7 +1900,7 @@ func routes(_ app: Application) throws {
             kind: input.kind,
             name: try InputValidation.name(input.name),
             tags: input.tags ?? [],
-            metadata: input.metadata,
+            metadata: SubjectProfileMetadata.updated(current: nil, replacement: input.metadata ?? [:], replaceProfileDetails: true),
             birthday: input.birthday,
             imageURL: input.imageURL
         )
