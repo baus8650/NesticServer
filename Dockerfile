@@ -7,7 +7,7 @@ FROM swift:6.2-noble AS build
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q dist-upgrade -y \
-    && apt-get install -y libjemalloc-dev
+    && apt-get install -y libjemalloc-dev python3 ca-certificates curl
 
 # Set up a build area
 WORKDIR /build
@@ -22,6 +22,8 @@ RUN swift package resolve \
 
 # Copy entire repo into container
 COPY . .
+
+RUN python3 scripts/build_country_database.py && python3 scripts/build_city_database.py
 
 RUN mkdir /staging
 

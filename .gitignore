@@ -11,3 +11,7 @@ db.sqlite
 .env.*
 !.env.example
 default.profraw
+
+Resources/geoip-country-*.bin
+Resources/geoip-city-*.bin
+Resources/geoip-locations.json

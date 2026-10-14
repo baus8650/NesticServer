@@ -134,7 +134,7 @@ struct DoseReminderTests {
             let routineID = try routine.requireID()
             let headers: HTTPHeaders = ["Authorization": "Bearer \(try await app.jwt.keys.sign(SessionToken(userId: userID)))"]
             let otherHeaders: HTTPHeaders = ["Authorization": "Bearer \(try await app.jwt.keys.sign(SessionToken(userId: other.requireID())))"]
-            let api = try app.testing(), start = Date().addingTimeInterval(-3600)
+            let api = try app.testing(), start = Date().addingTimeInterval(-7200)
             let input = NestReminderRequest(routineID: routineID, startFromFirstTracking: true, subjectID: subjectID, trackerID: routineID, intervalHours: 8, totalPills: nil, cadence: .afterDose, linkedTrackerID: nil, delayMinutes: 0, anchorDate: start, hour: 9, minute: 0)
             let created = try await api.sendRequest(.POST, "nests/\(nestID)/reminders", headers: headers, beforeRequest: { req async throws in try req.content.encode(input) })
             #expect(created.status == .ok)
@@ -144,9 +144,11 @@ struct DoseReminderTests {
             let unchanged = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: headers)
             #expect(try unchanged.content.decode([NestReminderResponse].self).first?.lastDoseAt == nil)
             struct Log: Content { let occurredAt: Date }
-            let loggedAt = Date().addingTimeInterval(-30)
+            let loggedAt = Date().addingTimeInterval(-3600)
             let logged = try await api.sendRequest(.POST, "routines/\(routineID)/log", headers: headers, beforeRequest: { req async throws in try req.content.encode(Log(occurredAt: loggedAt)) })
             #expect(logged.status == .ok)
+            let routineEvents = try logged.content.decode([ActionEventResponse].self)
+            #expect(!routineEvents.isEmpty && routineEvents.allSatisfy { abs($0.occurredAt.timeIntervalSince(loggedAt)) < 1 })
             let read = try await api.sendRequest(.GET, "nests/\(nestID)/reminders", headers: headers)
             let last = try read.content.decode([NestReminderResponse].self).first?.lastDoseAt
             #expect(last != nil && abs(last!.timeIntervalSince(loggedAt)) < 1)

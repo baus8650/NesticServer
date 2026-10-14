@@ -1,0 +1,3 @@
+IP Geolocation by DB-IP: https://db-ip.com
+DB-IP Country Lite and City Lite, October 2026. CC BY 4.0: https://creativecommons.org/licenses/by/4.0/
+Converted to name-only binary indexes by Nestic. Latitude and longitude discarded. Reduced-accuracy IP estimates; VPNs and relays can differ from actual location.
