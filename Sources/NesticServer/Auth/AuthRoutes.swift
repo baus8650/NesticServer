@@ -5,9 +5,12 @@ import Crypto
 import Foundation
 
 struct SessionToken: Content, Authenticatable, JWTPayload {
+    // Legacy/browser JWT lifetime. Persistent iOS credentials are validated
+    // against DeviceSession rows and do not use this expiry for authentication.
     static let expirationTime: TimeInterval = 60 * 60 * 24 * 7
     var expiration: ExpirationClaim
     var userId: UUID
+    var deviceSessionID: UUID?
 
     init(userId: UUID) {
         self.userId = userId
@@ -160,7 +163,7 @@ private func appleDisplayName(_ input: AppleSignInRequest, email: String?) -> St
     return "Apple user"
 }
 
-private func authTokenValue() -> String {
+func authTokenValue() -> String {
     var generator = SystemRandomNumberGenerator()
     let bytes = (0..<32).map { _ in UInt8.random(in: 0...UInt8.max, using: &generator) }
     return Data(bytes).base64EncodedString()
@@ -169,7 +172,7 @@ private func authTokenValue() -> String {
         .replacingOccurrences(of: "=", with: "")
 }
 
-private func authTokenHash(_ value: String) -> String {
+func authTokenHash(_ value: String) -> String {
     SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
@@ -217,7 +220,7 @@ func authRoutes(_ app: Application) throws {
         if req.application.environment == .testing {
             user.emailVerified = true
             try await user.save(on: req.db)
-            return RegisterResponse(token: try await req.jwt.sign(SessionToken(with: user)), requiresEmailVerification: false)
+            return RegisterResponse(token: try await req.issueLoginToken(for: user), requiresEmailVerification: false)
         }
         let (value, token) = try await makeAuthToken(for: user, kind: .emailVerification, lifetime: 60 * 60 * 24, on: req.db)
         try await token.save(on: req.db)
@@ -243,7 +246,7 @@ func authRoutes(_ app: Application) throws {
         guard user.emailVerified else {
             throw Abort(.forbidden, reason: "Please verify your email address before signing in. Check your inbox for the verification link.")
         }
-        return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
+        return TokenResponse(token: try await req.issueLoginToken(for: user))
     }
 
     app.post("auth", "apple") { req async throws -> TokenResponse in
@@ -257,7 +260,7 @@ func authRoutes(_ app: Application) throws {
                 existing.emailVerified = true
                 try await existing.save(on: req.db)
             }
-            return TokenResponse(token: try await req.jwt.sign(SessionToken(with: existing)))
+            return TokenResponse(token: try await req.issueLoginToken(for: existing))
         }
 
         try NesticTerms.requireAcceptance(input.acceptedTermsVersion)
@@ -283,7 +286,7 @@ func authRoutes(_ app: Application) throws {
         catch let error as any DatabaseError where error.isConstraintFailure {
             throw Abort(.conflict, reason: "That Apple account is already in use.")
         }
-        return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
+        return TokenResponse(token: try await req.issueLoginToken(for: user))
     }
 
     app.get("auth", "verify") { req async throws -> Response in
@@ -348,12 +351,34 @@ func authRoutes(_ app: Application) throws {
         }
         user.passwordHash = try await req.password.async.hash(input.password)
         token.usedAt = Date()
-        try await user.save(on: req.db)
-        try await token.save(on: req.db)
+        let userID = try user.requireID()
+        try await req.db.transaction { db in
+            try await user.save(on: db)
+            try await token.save(on: db)
+            try await DeviceSession.query(on: db).filter(\.$userID == userID).delete()
+        }
+        req.application.realtimeHub.disconnectSessions(userId: userID)
         return AuthMessageResponse(message: "Your password was changed. You can sign in now.")
     }
 
-    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
+    let protected = app.grouped(NesticSessionAuthenticator(), SessionToken.guardMiddleware())
+    // Upgrade a still-valid legacy login without asking the user to sign in again.
+    protected.post("auth", "session") { req async throws -> TokenResponse in
+        let session = try req.auth.require(SessionToken.self)
+        if session.deviceSessionID != nil, let token = req.headers.bearerAuthorization?.token {
+            return TokenResponse(token: token)
+        }
+        guard let user = try await User.find(session.userId, on: req.db) else { throw Abort(.unauthorized) }
+        return TokenResponse(token: try await req.issueDeviceSession(for: user))
+    }
+    protected.delete("auth", "session") { req async throws -> HTTPStatus in
+        let session = try req.auth.require(SessionToken.self)
+        if let id = session.deviceSessionID {
+            try await DeviceSession.query(on: req.db).filter(\.$id == id).delete()
+            req.application.realtimeHub.disconnectSessions(userId: session.userId, deviceSessionID: id)
+        }
+        return .noContent
+    }
     protected.post("auth", "apple", "link") { req async throws -> UserResponse in
         try await req.enforceAuthRateLimit(operation: "apple")
         let session = try req.auth.require(SessionToken.self)
@@ -480,6 +505,7 @@ func authRoutes(_ app: Application) throws {
             try await AuthToken.query(on: tx)
                 .filter(\.$userID == session.userId)
                 .delete()
+            try await DeviceSession.query(on: tx).filter(\.$userID == session.userId).delete()
             try await user.delete(on: tx)
         }
 

@@ -28,7 +28,7 @@ struct WSAck: Content {
 /// Simple hub that tracks WebSocket connections per nest and broadcasts messages.
 final class RealtimeHub: @unchecked Sendable {
     private let lock = NIOLock()
-    private struct Connection { let socket: WebSocket; let userId: UUID }
+    private struct Connection { let socket: WebSocket; let userId: UUID; let deviceSessionID: UUID? }
     private var privateOwners: [UUID: UUID] = [:]
     private var privateReaders: [UUID: Set<UUID>] = [:]
     func rememberPrivateOwners(_ owners: [UUID: UUID], readers: [UUID: Set<UUID>] = [:]) {
@@ -39,11 +39,11 @@ final class RealtimeHub: @unchecked Sendable {
     }
     private var socketsByNest: [UUID: [ObjectIdentifier: Connection]] = [:]
 
-    func add(_ ws: WebSocket, to nestId: UUID, userId: UUID) {
+    func add(_ ws: WebSocket, to nestId: UUID, userId: UUID, deviceSessionID: UUID? = nil) {
         let key = ObjectIdentifier(ws)
         lock.withLock {
             var bucket = socketsByNest[nestId] ?? [:]
-            bucket[key] = Connection(socket: ws, userId: userId)
+            bucket[key] = Connection(socket: ws, userId: userId, deviceSessionID: deviceSessionID)
             socketsByNest[nestId] = bucket
         }
 
@@ -75,6 +75,24 @@ final class RealtimeHub: @unchecked Sendable {
             for key in matches.keys { bucket.removeValue(forKey: key) }
             socketsByNest[nestId] = bucket.isEmpty ? nil : bucket
             return matches.values.map(\.socket)
+        }
+        for ws in removed { ws.eventLoop.execute { ws.close(promise: nil) } }
+    }
+
+    /// Revocation also closes live subscriptions, including those on this process.
+    func disconnectSessions(userId: UUID, deviceSessionID: UUID? = nil) {
+        let removed: [WebSocket] = lock.withLock {
+            var removed: [WebSocket] = []
+            for nestID in Array(socketsByNest.keys) {
+                guard var bucket = socketsByNest[nestID] else { continue }
+                let matches = bucket.filter {
+                    $0.value.userId == userId && (deviceSessionID == nil || $0.value.deviceSessionID == deviceSessionID)
+                }
+                removed.append(contentsOf: matches.values.map(\.socket))
+                for key in matches.keys { bucket.removeValue(forKey: key) }
+                socketsByNest[nestID] = bucket.isEmpty ? nil : bucket
+            }
+            return removed
         }
         for ws in removed { ws.eventLoop.execute { ws.close(promise: nil) } }
     }
@@ -707,7 +725,7 @@ private func forecastResponse(_ forecast: NestForecast) throws -> NestForecastRe
 }
 
 func routes(_ app: Application) throws {
-    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware(), TrackerPrivacyMiddleware())
+    let protected = app.grouped(NesticSessionAuthenticator(), SessionToken.guardMiddleware(), TrackerPrivacyMiddleware())
     protected.get("capabilities") { _ in ["privateTrackers": true, "privateRoutines": true, "privateForecasts": true, "selectedTrackerMembers": true] }
     try authRoutes(app)
     registerPhotoRoutes(protected)
@@ -897,7 +915,7 @@ func routes(_ app: Application) throws {
         req.eventLoop.makeFutureWithTask {
             guard let token = req.headers.bearerAuthorization?.token
                     ?? (try? req.query.get(String.self, at: "token")) else { return nil }
-            guard let session = try? await req.application.jwt.keys.verify(token, as: SessionToken.self),
+            guard let session = try await req.resolveSession(token),
                   try await User.find(session.userId, on: req.db) != nil else { return nil }
             req.auth.login(session)
             return HTTPHeaders()
@@ -912,7 +930,19 @@ func routes(_ app: Application) throws {
         let expiry = ws.eventLoop.scheduleTask(in: .seconds(Int64(max(0, session.expiration.value.timeIntervalSinceNow)))) {
             ws.close(promise: nil)
         }
+        let revocationCheck = ws.eventLoop.scheduleRepeatedAsyncTask(initialDelay: .seconds(60), delay: .seconds(60)) { _ in
+            ws.eventLoop.makeFutureWithTask {
+                guard session.deviceSessionID != nil else { return }
+                guard let token = req.headers.bearerAuthorization?.token
+                    ?? (try? req.query.get(String.self, at: "token")),
+                      try await req.resolveSession(token) != nil else {
+                    ws.close(promise: nil)
+                    return
+                }
+            }
+        }
         ws.onClose.whenComplete { _ in
+            revocationCheck.cancel()
             expiry.cancel()
             if let nid = subscribedNestId.withLockedValue({ $0 }) {
                 req.application.realtimeHub.remove(ws, from: nid)
@@ -940,7 +970,7 @@ func routes(_ app: Application) throws {
                             let old = current; current = nestId; return old
                         }
                         if let old, old != nestId { req.application.realtimeHub.remove(ws, from: old) }
-                        req.application.realtimeHub.add(ws, to: nestId, userId: session.userId)
+                        req.application.realtimeHub.add(ws, to: nestId, userId: session.userId, deviceSessionID: session.deviceSessionID)
                         let ack = WSEnvelope(v: 1, type: "ws.subscribed", nestId: nestId, ts: Date(), data: WSAck(message: "subscribed"))
                         let encoder = JSONEncoder()
                         encoder.dateEncodingStrategy = .iso8601

@@ -141,7 +141,7 @@ private func feedbackResponse(_ thread: FeedbackThread, on db: any Database, inc
 }
 
 func feedbackRoutes(_ app: Application) throws {
-    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
+    let protected = app.grouped(NesticSessionAuthenticator(), SessionToken.guardMiddleware())
     let admin = protected.grouped(AdminRouteMiddleware())
 
     protected.get("feedback") { req async throws -> [FeedbackThreadResponse] in

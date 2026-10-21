@@ -91,7 +91,7 @@ func analyticsRoutes(_ app: Application) throws {
         try await UsageEvent.query(on:req.db).filter(\.$createdAt < Date().addingTimeInterval(-90*86400)).delete()
         return .noContent
     }
-    let protected = app.grouped(SessionToken.authenticator(),SessionToken.guardMiddleware())
+    let protected = app.grouped(NesticSessionAuthenticator(),SessionToken.guardMiddleware())
     protected.get("admin","analytics") { req async throws -> UsageDashboard in
         _ = try await req.requireNesticAdmin()
         let requested = req.query[Int.self,at:"days"] ?? 30

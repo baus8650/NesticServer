@@ -207,3 +207,25 @@ Forecast publishing includes `inputTrackerIDs`. The backend checks source audien
 `GET /admin/analytics?days=7|30|90` requires a verified Nestic administrator, not merely a nest owner/admin. It includes daily traffic, store-click, signup and activity totals plus optional breakdowns and recent events. Counts are estimates, not unique people or confirmed installations. Event cleanup runs every six hours and on ingestion; events outside the 90-day window are excluded from dashboards.
 
 Country, region and city estimates use **offline** DB-IP Lite databases. No visitor addresses are sent to a third-party service. Docker builds run `scripts/build_country_database.py` and `scripts/build_city_database.py`, verify the pinned October 2026 CSV checksum, and bundle compact indexes containing country/region/city names only (coordinates are discarded) in `Resources/`. For local use, run the script once; a local downloaded gzip path can be passed as an argument. Refresh the pinned release/checksum when updating country data. Preserve the CC BY 4.0 attribution in `Resources/GEOIP-LICENSE.txt` and administrator dashboards. Location estimates can differ from actual locations for VPNs and privacy relays.
+
+### Persistent iOS sessions
+
+Native requests opt in with `X-Nestic-Persistent-Session: 1`. Login, registration,
+Apple sign-in, and Google sign-in then return a random device credential instead
+of a seven-day JWT. Only its SHA-256 hash is stored in `device_sessions`; there is
+no inactivity or absolute expiry. HTTP and WebSocket authentication both check
+that the session and account still exist. Browser clients continue using JWTs.
+
+`POST /auth/session` exchanges a valid legacy JWT for a device session (and is
+idempotent for an existing device session). `DELETE /auth/session` revokes only
+the current device. Password reset revokes every device session; deleting an
+account also removes its sessions. Live sockets close on local revocation and
+check for revocation across replicas every minute.
+
+Deploy the server and run migrations, including `CreateDeviceSessions`, before
+releasing the updated iOS app. A still-valid saved iOS JWT upgrades on the next
+successful foreground refresh. Already-expired JWTs require one final sign-in;
+the server cannot safely upgrade an expired credential.
+
+Run the persistence/revocation regression tests against an isolated local test
+database with `RUN_DATABASE_TESTS=true swift test --filter DeviceSession`.

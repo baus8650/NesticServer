@@ -101,9 +101,9 @@ func googleAuthRoutes(_ app: Application) {
             catch let error as any DatabaseError where error.isConstraintFailure { throw Abort(.conflict, reason: "That Google account or email is already in use. Sign in again.") }
             return user
         }
-        return TokenResponse(token: try await req.jwt.sign(SessionToken(with: user)))
+        return TokenResponse(token: try await req.issueLoginToken(for: user))
     }
-    let protected = app.grouped(SessionToken.authenticator(), SessionToken.guardMiddleware())
+    let protected = app.grouped(NesticSessionAuthenticator(), SessionToken.guardMiddleware())
     protected.post("auth", "google", "link") { req async throws -> UserResponse in
         try await req.enforceAuthRateLimit(operation: "google")
         let session = try req.auth.require(SessionToken.self)
