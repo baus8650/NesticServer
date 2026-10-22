@@ -47,10 +47,12 @@ struct SeedAppReviewData: AsyncMigration {
         }
         let nestID = try nest.requireID()
 
+        let secondMemberID = try await seedHouseholdMember(nestID: nestID, on: db)
+
         // Do not overwrite an account that a reviewer or tester has already
         // started using. A fresh App Review account receives the full fixture.
         if try await Entity.query(on: db).filter(\.$nest.$id == nestID).count() == 0 {
-            try await seedContent(userID: userID, nestID: nestID, on: db)
+            try await seedContent(userID: userID, secondMemberID: secondMemberID, nestID: nestID, on: db)
         }
     }
 
@@ -71,7 +73,25 @@ struct SeedAppReviewData: AsyncMigration {
         return nil
     }
 
-    private func seedContent(userID: UUID, nestID: UUID, on db: any Database) async throws {
+    /// A fictional household member, never emailed and without a known login password.
+    private func seedHouseholdMember(nestID: UUID, on db: any Database) async throws -> UUID {
+        let email = "jamie@nestic-review.invalid"
+        let member: User
+        if let existing = try await User.query(on: db).filter(\.$email == email).first() {
+            member = existing
+        } else {
+            member = User(email: email, passwordHash: try Bcrypt.hash(UUID().uuidString + UUID().uuidString),
+                          displayName: "Jamie", emailVerified: true)
+            try await member.save(on: db)
+        }
+        let id = try member.requireID()
+        if try await NestMember.query(on: db).filter(\.$nest.$id == nestID).filter(\.$user.$id == id).first() == nil {
+            try await NestMember(nestID: nestID, userID: id, role: .member).save(on: db)
+        }
+        return id
+    }
+
+    private func seedContent(userID: UUID, secondMemberID: UUID, nestID: UUID, on db: any Database) async throws {
         let maple = Entity(nestID: nestID, kind: .pet, name: "Parker", tags: ["companion", "demo"])
         let jordan = Entity(nestID: nestID, kind: .person, name: "Penny", tags: ["household", "demo"])
         let home = Entity(nestID: nestID, kind: .thing, name: "Home", tags: ["space", "demo"])
@@ -156,7 +176,7 @@ struct SeedAppReviewData: AsyncMigration {
                 note: day == 0 ? "Morning meal recorded." : nil
             ).save(on: db)
             try await ActionEvent(
-                nestID: nestID, entityID: mapleID, actionID: outdoorTimeID, actorUserID: userID,
+                nestID: nestID, entityID: mapleID, actionID: outdoorTimeID, actorUserID: secondMemberID,
                 occurredAt: base.addingTimeInterval(-6 * 60 * 60),
                 valueNumber: 20 + Double(day % 4) * 5
             ).save(on: db)
@@ -186,7 +206,7 @@ struct SeedAppReviewData: AsyncMigration {
             occurredAt: now.addingTimeInterval(-2 * 60 * 60), valueNumber: 5
         ).save(on: db)
         try await ActionEvent(
-            nestID: nestID, entityID: homeID, actionID: homeCheckID, actorUserID: userID,
+            nestID: nestID, entityID: homeID, actionID: homeCheckID, actorUserID: secondMemberID,
             occurredAt: now.addingTimeInterval(-45 * 60), note: "Evening home check completed."
         ).save(on: db)
 
